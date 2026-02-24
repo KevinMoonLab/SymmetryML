@@ -1,0 +1,57 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual envs
+.venv/
+venv/
+.env/
+.env.*
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Tests, coverage, linters
+.pytest_cache/
+.tox/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pyright/
+.pytype/
+
+# Jupyter / experiments
+.ipynb_checkpoints/
+*.ipynb~*
+.dvc/
+.mlflow/
+
+# Logs and temp
+*.log
+*.tmp
+*.swp
+*.swo
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Data artifacts (customize!)
+data/*.csv
+data/*.parquet
+data/raw/
+data/interim/
+data/processed/
+
+# Poetry / pipenv (if used)
+poetry.lock
+Pipfile.lock
+
