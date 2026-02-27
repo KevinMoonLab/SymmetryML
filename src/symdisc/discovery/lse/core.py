@@ -17,11 +17,14 @@ Distances along the level set are left as stubs for now.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Literal, Optional, Tuple, Union
+from typing import Callable, Literal, Optional, Tuple, Union, Any, Dict
 
 import numpy as np
 from sklearn.decomposition import IncrementalPCA, PCA
 from sklearn.preprocessing import PolynomialFeatures
+
+from .projections import get_projection
+from .distances import get_distance
 
 # Public types
 FeatureMode = Literal["precomputed", "polynomial", "callable"]
@@ -168,7 +171,6 @@ class LSE:
     - If a feature Jacobian J_φ(x) is available (analytic or numeric),
       we expose constraint Jacobians: J_g(x) = J_φ(x)^T W.
 
-    Distances between *points on the level set* are left as stubs for now.
     """
 
     # Feature configuration
@@ -212,6 +214,7 @@ class LSE:
     lowvar_indices_: Optional[np.ndarray] = field(default=None, init=False)  # indices into components_
     p_: Optional[int] = field(default=None, init=False)
     d_: Optional[int] = field(default=None, init=False)
+    manifold_dim_: Optional[int] = field(default=None, init=False) # set by estimate_dimension
 
     # =========================
     # Core fitting
@@ -480,6 +483,53 @@ class LSE:
         return Jg
 
     # =========================
+    # Evaluating the LSE function
+    # =========================
+
+    def _feature_map(self, X: np.ndarray) -> np.ndarray:
+        """
+        Compute features φ(X) with the same ordering as used in fit().
+        Returns (N, p).
+        """
+        if not self.fitted_:
+            raise RuntimeError("Call fit() first.")
+        X = np.asarray(X, dtype=np.float64)
+        if self.mode == "polynomial":
+            if self.poly_ is None:
+                raise RuntimeError("PolynomialFeatures not initialized.")
+            # Use the same transformer as training
+            return self.poly_.transform(X)  # (N, p)
+        elif self.mode == "callable":
+            if self.feature_func is None:
+                raise RuntimeError("feature_func must be provided.")
+            F = self.feature_func(X)
+            F = np.asarray(F, dtype=np.float64)
+            if F.ndim != 2 or F.shape[1] != self.p_:
+                raise ValueError("feature_func returned wrong shape.")
+            return F
+        elif self.mode == "precomputed":
+            raise RuntimeError(
+                "In mode='precomputed' we cannot compute φ(X) for new X. "
+                "Provide a feature_func or use polynomial mode if you need projection."
+            )
+        else:
+            raise ValueError(f"Unknown mode: {self.mode}")
+
+    # this IS the level set function
+    def constraint_values(self, X: np.ndarray) -> np.ndarray:
+        """
+        Evaluate g(X) = W^T (φ(X) - μ_φ), shape (N, r).
+        """
+        if not self.fitted_:
+            raise RuntimeError("Call fit() first.")
+        if self.constraint_weights_ is None:
+            raise RuntimeError("No constraint weights found. Fit and select low-variance first.")
+        F = self._feature_map(X)  # (N, p)
+        mu = np.asarray(self.pca_.mean_, dtype=np.float64)  # (p,)
+        W = self.constraint_weights_  # (p, r)
+        return (F - mu) @ W  # (N, r)
+
+    # =========================
     # Accessors / utilities
     # =========================
     @property
@@ -500,19 +550,199 @@ class LSE:
     # =========================
     # Distances on the level set (stubs for now)
     # =========================
-    def distance(self, P: np.ndarray, Q: np.ndarray, method: str = "geodesic") -> np.ndarray:
-        """
-        Placeholder: distances *between points on the level set*. To be implemented.
-        Options may include:
-          - 'graph-geodesic' (kNN graph embedded within near-level points),
-          - 'tangent-metric' (induced Riemannian metric via constraints),
-          - 'diffusion' (PHATE/DM-like on level-set samples).
-        """
-        raise NotImplementedError("On-manifold distance is not implemented yet.")
 
-    def project_to_level_set(self, X: np.ndarray) -> np.ndarray:
+    def project_to_level_set(
+        self,
+        X: np.ndarray,
+        method: str = "penalty-homotopy",
+        **kwargs
+    ):
         """
-        Optional future: project off-manifold points onto the level set defined by g_l(x)=const.
-        Useful for off-manifold detection but not required now.
+        Project off-manifold points onto g(x)=0 using a registered strategy.
         """
-        raise NotImplementedError("Projection to level set is not implemented yet.")
+        if self.mode == "precomputed":
+            raise RuntimeError("Projection requires polynomial/callable features (not precomputed).")
+        proj = get_projection(method)
+        return proj(self, X, **kwargs)
+
+    def distance(
+        self,
+        P: np.ndarray,
+        Q: np.ndarray,
+        method: str = "chord",
+        *,
+        projection_method: Optional[str] = None,
+        projection_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs
+    ):
+        """
+        Distance between points, possibly using a projection method.
+        - If `method` needs on-manifold points, it may call projection via
+          `projection_method` (defaults chosen inside the distance strategy).
+        """
+        dist_fn = get_distance(method)
+        return dist_fn(
+            self, P, Q,
+            projection_method=projection_method,
+            projection_kwargs=projection_kwargs or {},
+            **kwargs
+        )
+
+    def distance_to(
+        self,
+        X: np.ndarray,
+        *,
+        projection_method: str = "penalty-homotopy",
+        projection_kwargs: Optional[Dict[str, Any]] = None,
+    ):
+        """
+        Distance from off-manifold points to the manifold:
+            d(x, M) = ||x - Π_M(x)||, where projection method is selectable.
+        """
+        Y, info = self.project_to_level_set(
+            X, method=projection_method, **(projection_kwargs or {})
+        )
+        d = np.linalg.norm(np.asarray(X) - np.asarray(Y), axis=-1)
+        return d, {"projection": info}
+
+
+    # =========================
+    # Dimension estimation
+    # =========================
+    def estimate_dimension(
+        self,
+        Y: Optional[np.ndarray] = None,
+        *,
+        assume_on_manifold: bool = False,
+        projection_method: str = "svd-pseudoinverse",
+        projection_kwargs: Optional[Dict[str, Any]] = None,
+        svd_rel: float = 1e-3,
+        svd_abs: float = 1e-12,
+        aggregate: Literal["mode", "median", "mean"] = "mode",
+        return_pointwise: bool = False,
+    ) -> Tuple[int, Dict[str, Any]]:
+        """
+        Estimate the intrinsic manifold dimension as:
+            dim_i = d - rank(J_g(y_i)),
+        where rank(J_g) is computed via truncated SVD at (projected) manifold points.
+
+        Parameters
+        ----------
+        Y : (N, d) optional
+            Points at which to estimate the dimension. If None, uses training X_.
+        assume_on_manifold : bool
+            If False (default), project Y to the manifold using `projection_method`.
+            If True, treat Y as already on-manifold and skip projection.
+        projection_method : str
+            Projection strategy name registered in the projections registry
+            (default: 'svd-pseudoinverse' – fast and suitable as a retraction).
+        projection_kwargs : dict
+            Keyword arguments forwarded to the projection method.
+        svd_rel, svd_abs : float
+            Truncation thresholds for singular values: keep σ_i if
+            σ_i >= max(svd_rel * σ_max, svd_abs). Only singular values above this
+            threshold contribute to the normal rank.
+        aggregate : {'mode', 'median', 'mean'}
+            How to form the global dimension estimate from pointwise dims.
+            'mode' is robust to local degeneracies; 'median' and 'mean' are also allowed.
+        return_pointwise : bool
+            If True, include per-point normal ranks and dimensions in the returned info.
+
+        Returns
+        -------
+        dim_hat : int
+            Global manifold dimension estimate.
+        info : dict
+            Diagnostics including:
+                - 'dims': (N,) per-point dimension estimates (if return_pointwise)
+                - 'ranks': (N,) per-point normal-space ranks (if return_pointwise)
+                - 'residuals': (N,) ||g(y_i)|| at evaluation points
+                - 'd_ambient': ambient dimension d
+                - 'rank_hist': (unique_dims, counts)
+                - 'projection': projection diagnostics (if projection performed)
+
+        Notes
+        -----
+        - Requires access to J_phi (i.e., mode != 'precomputed').
+        - For robust estimates, we recommend projecting Y to the manifold first
+          (assume_on_manifold=False) so the row-space of J_g reflects true normals.
+        """
+        if not self.fitted_:
+            raise RuntimeError("Call fit() first.")
+
+        # Need a feature Jacobian to construct J_g: not available in precomputed mode
+        if self.mode == "precomputed":
+            raise RuntimeError(
+                "estimate_dimension requires polynomial/callable features (not precomputed), "
+                "because it needs J_phi to compute J_g."
+            )
+
+        proj_info = None
+        if Y is None:
+            if self.X_ is None:
+                raise RuntimeError("No data available. Pass Y explicitly or call fit(X=...).")
+            Y = self.X_
+        Y = np.asarray(Y, dtype=np.float64)
+        if Y.ndim != 2:
+            raise ValueError("Y must be (N, d).")
+
+        # Project to the manifold if requested
+        if not assume_on_manifold:
+            Y, proj_info = self.project_to_level_set(
+                Y, method=projection_method, **(projection_kwargs or {})
+            )
+
+        # Compute constraint Jacobians at evaluation points
+        Jg = self.get_constraint_jacobian(Y)  # (N, r, d)
+        N, r, d = Jg.shape
+
+        ranks = np.empty(N, dtype=int)
+        dims = np.empty(N, dtype=int)
+        residuals = np.linalg.norm(self.constraint_values(Y), axis=1)
+
+        for i in range(N):
+            Ji = Jg[i]  # (r, d)
+            if Ji.size == 0:
+                # No constraints: normal rank is 0, manifold is full ambient dimension
+                rank_i = 0
+            else:
+                U, S, Vt = np.linalg.svd(Ji, full_matrices=False)
+                sigma_max = S[0] if S.size > 0 else 0.0
+                tau = max(svd_rel * sigma_max, svd_abs)
+                rank_i = int(np.sum(S >= tau))
+            ranks[i] = rank_i
+            dims[i] = int(d - rank_i)
+
+        # Aggregate to a global estimate
+        if aggregate == "mode":
+            uniq, cnts = np.unique(dims, return_counts=True)
+            # pick the most frequent; break ties by choosing the larger count then larger dimension
+            j = int(np.argmax(cnts))
+            dim_hat = int(uniq[j])
+        elif aggregate == "median":
+            dim_hat = int(np.median(dims))
+            uniq, cnts = np.unique(dims, return_counts=True)
+        elif aggregate == "mean":
+            dim_hat = int(np.round(np.mean(dims)))
+            uniq, cnts = np.unique(dims, return_counts=True)
+        else:
+            raise ValueError("aggregate must be one of {'mode','median','mean'}.")
+
+        # Persist on the instance
+        self.manifold_dim_ = dim_hat
+
+        info: Dict[str, Any] = {
+            "d_ambient": d,
+            "rank_hist": (uniq, cnts),
+            "residuals": residuals,
+            "projection": proj_info,
+            "svd_rel": svd_rel,
+            "svd_abs": svd_abs,
+            "aggregate": aggregate,
+        }
+        if return_pointwise:
+            info["ranks"] = ranks
+            info["dims"] = dims
+
+        return dim_hat, info
+

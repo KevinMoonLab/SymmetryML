@@ -9,7 +9,7 @@ from sklearn.decomposition import PCA
 
 from .builders import getFunctionInvarianceMatrix
 # Reuse LSE’s internal Jacobian utilities to avoid duplication
-from .lse import _numeric_feature_jacobian, _poly_feature_jacobian_batch, _iterate_batches
+from .lse.core import _numeric_feature_jacobian, _poly_feature_jacobian_batch, _iterate_batches
 
 FeatureMode = Literal["precomputed", "polynomial", "callable"]
 LowVarPolicy = Literal["count", "relative", "absolute", "eigengap"]
