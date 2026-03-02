@@ -64,6 +64,8 @@ d, info2 = lse.distance(np.array([1.0,0.0,0.0]), np.array([0.0,1.0,0.0]), method
 t1 = time.time()
 d3, info3 = lse.distance(np.array([1.0,0.0,0.0]), np.array([0.0,1.0,0.0]), method="geodesic-ptm", step_size=0.1)
 t2 = time.time()
+d4, info4 = lse.distance(np.array([1.0,0.0,0.0]), np.array([0.0,1.0,0.0]), method="second-order")
+t3 = time.time()
 
 #print(Y_proj)
 #print(info1)
@@ -73,5 +75,11 @@ print(t1-t0)
 print(d3)
 print(t2-t1)
 #print(info3)
+print(d4)
+print(t3-t2)
+
+
+# invariance regularization testing
+
 
 

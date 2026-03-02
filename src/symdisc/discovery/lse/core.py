@@ -565,6 +565,54 @@ class LSE:
         proj = get_projection(method)
         return proj(self, X, **kwargs)
 
+    def transform(
+        self,
+        X: np.ndarray,
+        *,
+        method: str = "svd-pseudoinverse",
+        return_info: bool = False,
+        **projection_kwargs
+    ):
+        """
+        Project points X onto the estimated level set g(x)=0 using a registered projection.
+
+        This is a convenience wrapper that mirrors PCA.transform semantics:
+        it returns the projected data (and optionally diagnostics), using a
+        fast, SVD-based pseudoinverse projector by default.
+
+        Parameters
+        ----------
+        X : (N, d) array
+            Input points to project.
+        method : str, default='svd-pseudoinverse'
+            Name of the projection strategy registered in `symdisc.lse.projections`.
+        return_info : bool, default=False
+            If True, also return the projection diagnostics dict.
+        **projection_kwargs
+            Extra keywords forwarded to the chosen projection method.
+
+        Returns
+        -------
+        Y : (N, d) array
+            Projected points on the level set.
+        info : dict (optional)
+            Diagnostics from the projection method if return_info=True.
+
+        Notes
+        -----
+        - Requires polynomial/callable features (not precomputed), since the
+          projector uses J_phi / J_g.
+        - For the default 'svd-pseudoinverse', this acts as a fast local retraction.
+        """
+        if self.mode == "precomputed":
+            raise RuntimeError(
+                "transform() requires polynomial/callable features (not precomputed), "
+                "because projection uses J_phi/J_g."
+            )
+        proj = get_projection(method)
+        Y, info = proj(self, np.asarray(X, dtype=np.float64), **projection_kwargs)
+        return (Y, info) if return_info else Y
+
     def distance(
         self,
         P: np.ndarray,

@@ -24,4 +24,5 @@ def list_distances() -> Iterable[str]:
 # import built-ins
 from . import chord  # noqa: F401
 from . import geodesic_projected
+from . import second_order
 
