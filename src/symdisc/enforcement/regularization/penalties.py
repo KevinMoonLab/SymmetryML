@@ -18,14 +18,24 @@ def _ensure_list(fields: Union[VectorField, Iterable[VectorField]]) -> List[Vect
     return list(fields)
 
 def _call_field(field: VectorField, x: Tensor, *, meta: Optional[Dict[str, Any]], grad: Optional[Tensor]) -> Tensor:
-    # Allow fields that accept grad=...; otherwise ignore it.
+    """
+    Call a vector field with best-effort support for optional meta/grad.
+    Tries the most general signature first, then falls back progressively.
+    """
+    # Try: field(x, meta=..., grad=...)
     try:
-        sig = inspect.signature(field)
-        if "grad" in sig.parameters:
-            return field(x, meta=meta, grad=grad)
-    except (TypeError, ValueError):
+        return field(x, meta=meta, grad=grad)
+    except TypeError:
         pass
-    return field(x, meta=meta)
+
+    # Try: field(x, meta=...)
+    try:
+        return field(x, meta=meta)
+    except TypeError:
+        pass
+
+    # Final fallback: field(x)
+    return field(x)
 
 def _weighted_reduce(vals: Tensor, weights: Optional[Sequence[float]], reduction: Literal["mean","sum","weighted_mean"]) -> Tensor:
     if weights is None:
@@ -77,6 +87,20 @@ def _batched_jvp_over_fields(
     Xf = func_vmap(jvp_one_direction)(v_stacked)  # (K, *y.shape)
     return y, Xf
 
+def _apply_loss(loss: LossFn, residual: Tensor) -> Tensor:
+    """
+    Apply a user-provided loss that can be either:
+      - unary: loss(residual) -> scalar
+      - binary (PyTorch criterion style): loss(residual, target) -> scalar
+        In this case, we pass target=zeros_like(residual).
+    """
+    try:
+        # Unary style: e.g., lambda v: (v**2).mean()
+        return loss(residual)
+    except TypeError:
+        # Binary style: e.g., nn.HuberLoss(), nn.MSELoss()
+        return loss(residual, torch.zeros_like(residual))
+
 def invariance_penalty(
     model: Callable[[Tensor], Tensor],
     X: Union[VectorField, Iterable[VectorField]],
@@ -115,7 +139,8 @@ def invariance_penalty(
     # Loss per field
     vals = []
     for k in range(Xf_stacked.shape[0]):
-        vals.append(loss(Xf_stacked[k]))
+        #vals.append(loss(Xf_stacked[k]))
+        vals.append(_apply_loss(loss, Xf_stacked[k]))
     vals = torch.stack(vals)  # (K,)
 
     return _weighted_reduce(vals, weights, reduction)
@@ -171,7 +196,8 @@ def equivariance_penalty(
     vals = []
     for k in range(Xf_stacked.shape[0]):
         diff = _apply_mask(Xf_stacked[k] - Yf_list[k], mask)
-        vals.append(loss(diff))
+        #vals.append(loss(diff))
+        vals.append(_apply_loss(loss, diff))
     vals = torch.stack(vals)
     return _weighted_reduce(vals, weights, reduction)
 
@@ -210,7 +236,8 @@ def forward_with_invariance_penalty(
 
     vals = []
     for k in range(Xf_stacked.shape[0]):
-        vals.append(loss(Xf_stacked[k]))
+        #vals.append(loss(Xf_stacked[k]))
+        vals.append(_apply_loss(loss, Xf_stacked[k]))
     vals = torch.stack(vals)
     pen = _weighted_reduce(vals, weights, reduction)
     return y, pen
@@ -261,7 +288,8 @@ def forward_with_equivariance_penalty(
     vals = []
     for k in range(Xf_stacked.shape[0]):
         diff = _apply_mask(Xf_stacked[k] - Yf_list[k], mask)
-        vals.append(loss(diff))
+        #vals.append(loss(diff))
+        vals.append(_apply_loss(loss, diff))
     vals = torch.stack(vals)
     pen = _weighted_reduce(vals, weights, reduction)
     return y, pen

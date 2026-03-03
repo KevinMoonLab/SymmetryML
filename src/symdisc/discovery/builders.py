@@ -358,6 +358,67 @@ def _eval_vf_codomain_torch(Y, vf_list: List[Callable], torch):
 
 
 # ============================================================================
+# For Model Jacobians, here is a helper to make it callable.
+# ============================================================================
+
+def make_model_jacobian_callable_torch(
+    model,
+    *,
+    batch_size: int = 256,
+    create_graph: bool = False,
+):
+    """
+    Returns a callable J(X) -> (N, m, d) that computes the per-sample Jacobian
+    of model outputs wrt inputs using autograd. Works for scalar or vector outputs.
+    - No top-level torch import; uses _maybe_import_torch().
+    - Honors dtype/device of input X at call time.
+    - Complexity ~ O(N * m) backward calls.
+    """
+    torch = _maybe_import_torch()
+    if torch is None:
+        raise RuntimeError("make_model_jacobian_callable_torch requires PyTorch.")
+
+    def J(X):
+        # Accept numpy or torch; coerce to torch and preserve dtype/device
+        X_t = X if isinstance(X, torch.Tensor) else torch.as_tensor(X)
+        assert X_t.ndim == 2, f"X must be (N,d), got {tuple(X_t.shape)}"
+
+        model.eval()
+        N, d = X_t.shape
+        device = X_t.device
+        dtype  = X_t.dtype
+
+        blocks = []
+        # We detach at chunk boundaries and re-enable grad for each chunk
+        for i in range(0, N, batch_size):
+            xb = X_t[i:i+batch_size].clone().detach().to(device=device, dtype=dtype).requires_grad_(True)
+            yb = model(xb)  # (B,m) or (B,)
+            if yb.ndim == 1:
+                yb = yb.unsqueeze(-1)
+            B, m = yb.shape
+
+            # Compute Jacobian block: (B, m, d)
+            J_block = []
+            # Loop over output channels; inner loop over samples
+            for k in range(m):
+                grads_k = []
+                for b in range(B):
+                    g = torch.autograd.grad(
+                        yb[b, k],
+                        xb,
+                        retain_graph=True,
+                        create_graph=create_graph,
+                        allow_unused=False
+                    )[0][b]  # (d,)
+                    grads_k.append(g)
+                J_block.append(torch.stack(grads_k, dim=0))  # (B, d)
+            J_block = torch.stack(J_block, dim=1)  # (B, m, d)
+            blocks.append(J_block.detach() if not create_graph else J_block)
+        return torch.cat(blocks, dim=0)  # (N, m, d)
+
+    return J
+
+# ============================================================================
 # Public builders
 # ============================================================================
 
@@ -588,8 +649,8 @@ def getEquivariantResidualMatrix(
 
     info = {"N": N, "d": d, "p": p, "q_in": q_in, "q_out": q_out, "coupling": coupling}
     return M, info
-    
-    
+
+
 # --- Append the following builder to builders.py (after existing builders) ---
 
 def getFunctionInvarianceMatrix(
