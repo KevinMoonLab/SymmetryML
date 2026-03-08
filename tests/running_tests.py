@@ -9,13 +9,16 @@ import random
 from dataclasses import dataclass
 from typing import Dict, Callable, Tuple, Optional
 
+from symdisc import generate_euclidean_killing_fields_with_names
 from symdisc.discovery import make_model_jacobian_callable_torch
-from symdisc.enforcement.regularization.penalties import forward_with_invariance_penalty
+from symdisc.enforcement.regularization.penalties import forward_with_invariance_penalty, \
+    forward_with_equivariance_penalty
+from symdisc.enforcement.regularization.schedules import jump
 
 matplotlib.use('QtAgg') # Or 'Qt5Agg', 'QtAgg', 'WebAgg', 'TkAgg', etc.
 import matplotlib.pyplot as plt
 import time
-
+'''
 from symdisc import (
     LSE,
     getExtendedFeatureMatrix,
@@ -37,6 +40,7 @@ X = np.column_stack([np.cos(t), np.sin(t), np.zeros_like(t)])  # (N,3)
 #ax.set_ylabel("y")
 #ax.set_zlabel("z")
 #plt.show(block=False)
+
 
 # ---- LSE fit (polynomial features)
 lse = LSE(
@@ -73,7 +77,7 @@ print(names)
 est_dim, diminfo = lse.estimate_dimension()
 print("Estimated Dimension: ", est_dim)
 #Y_proj, info1 = lse.project_to_level_set(np.array([[1.0,0.0,4.0]]), method="penalty-homotopy")
-'''
+
 t0 = time.time()
 d, info2 = lse.distance(np.array([1.0,0.0,0.0]), np.array([0.0,1.0,0.0]), method="chord")
 t1 = time.time()
@@ -98,8 +102,6 @@ print(d5)
 print(t4-t3)
 '''
 
-# invariance regularization testing
-
 # -------------------------
 # Reproducibility
 # -------------------------
@@ -118,16 +120,16 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # -------------------------
 # Synthetic dataset
 # -------------------------
-class XYZRDataset(Dataset):
+class XYRDataset(Dataset):
     """
-    Points in R^3 with target t = exp(x^2 + y^2).
+    Points in R^2 with target t = (1+x^2+y^2)*[x,y].
     A split can be made via the half-plane y >= 0 (train) vs y < 0 (test).
     """
     def __init__(self, X: np.ndarray, y: np.ndarray):
-        assert X.shape[1] == 3
-        assert y.ndim == 1 or (y.ndim == 2 and y.shape[1] == 1)
+        assert X.shape[1] == 2
+        assert y.ndim == 2 or (y.ndim == 2 and y.shape[1] == 2)
         self.X = torch.from_numpy(X).float()
-        self.y = torch.from_numpy(y.reshape(-1, 1)).float()
+        self.y = torch.from_numpy(y).float() #torch.from_numpy(y.reshape(-1, 1)).float()
 
     def __len__(self):
         return self.X.shape[0]
@@ -137,19 +139,17 @@ class XYZRDataset(Dataset):
 
 
 def generate_points(n_total: int = 1000,
-                    xy_range: float = 1.5,
-                    z_range: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+                    xy_range: float = 1.5) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Generate points uniformly in x,y ∈ [-xy_range, xy_range], z ∈ [-z_range, z_range]
-    Target t = exp(x^2 + y^2).
+    Generate points uniformly in x,y ∈ [-xy_range, xy_range]
+    Target t = (1+x^2+y^2)*[x,y].
     """
-    X = np.empty((n_total, 3), dtype=np.float32)
+    X = np.empty((n_total, 2), dtype=np.float32)
     for i in range(n_total):
         x = np.random.uniform(-xy_range, xy_range)
         y = np.random.uniform(-xy_range, xy_range)
-        z = np.random.uniform(-z_range, z_range)
-        X[i] = (x, y, z)
-    y = np.exp(X[:, 0]**2 + X[:, 1]**2) # + X[:, 2]**2)
+        X[i] = (x, y)
+    y = X * (1 + X[:, 0]**2 + X[:, 1]**2)[:, None] #np.exp(X[:, 0]**2 + X[:, 1]**2) # + X[:, 2]**2)
     return X, y
 
 
@@ -186,11 +186,11 @@ class SmallRegressor(nn.Module):
         super().__init__()
         act_layer = nn.SiLU() if act == "silu" else nn.GELU()
         self.net = nn.Sequential(
-            nn.Linear(3, hidden),
+            nn.Linear(2, hidden),
             act_layer,
             nn.Linear(hidden, hidden),
             act_layer,
-            nn.Linear(hidden, 1),
+            nn.Linear(hidden, 2),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -208,6 +208,8 @@ class TrainConfig:
     weight_decay: float = 0.0
     lambda_R01: float = 1.0        # weight for rotation invariance penalty
     lambda_T2: float = 1.0         # initially off; set >0 to enforce z-translation too
+    gamma_val: float = 0.5             # this should be strictly between 0 and 1
+    gamma_wait: int = epochs//2
     print_every: int = 50
 
 
@@ -244,12 +246,15 @@ def evaluate(model: nn.Module, loader: DataLoader) -> Dict[str, float]:
         "R2": r2,
     }
 
-X, y = generate_points(n_total=4000, xy_range=1.5, z_range=1.0)
+X, y = generate_points(n_total=4000, xy_range=1.5)
 X_train, y_train, X_test, y_test = split_upper_lower_half_plane(X, y)
 
+# Euclidean Killing fields in ambient R^3
+kvs, names = generate_euclidean_killing_fields_with_names(d=X.shape[1])
+
 # Dataloaders
-train_ds = XYZRDataset(X_train, y_train)
-test_ds = XYZRDataset(X_test, y_test)
+train_ds = XYRDataset(X_train, y_train)
+test_ds = XYRDataset(X_test, y_test)
 train_loader = DataLoader(train_ds, batch_size=128, shuffle=True, drop_last=False)
 test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, drop_last=False)
 
@@ -257,30 +262,27 @@ test_loader = DataLoader(test_ds, batch_size=256, shuffle=False, drop_last=False
 model = SmallRegressor(hidden=32, act="silu").to(device)
 cfg = TrainConfig(
     batch_size=128,
-    epochs=1000,
+    epochs=4000,
     lr=1e-3,
     weight_decay=1e-4,
-    lambda_R01=1e0,  # start with rotation invariance only
-    lambda_T2=0.0,   # set to >0 later to test z-translation invariance
+    lambda_R01=1.0,
+    lambda_T2=0.0,
     print_every=50,
+    gamma_val=0.0,   # between 0 and 1.
+    gamma_wait=100
 )
 
 opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
 model_criterion = nn.MSELoss()
 
-Rxy, Tz = kvs[3], kvs[2]
+Rxy = kvs[2]
 
-active_fields = []
-weights = []
+active_fields = [Rxy]
+weights = [1.0]
 
-if cfg.lambda_R01 > 0.0:
-    active_fields.append(Rxy)
-    weights.append(cfg.lambda_R01)
+penalties_scaled = False
 
-if cfg.lambda_T2 > 0.0:
-    active_fields.append(Tz)
-    weights.append(cfg.lambda_T2)
-
+gamma_schedule = jump(cfg.gamma_val, cfg.gamma_wait)
 
 for epoch in range(1, cfg.epochs + 1):
     model.train()
@@ -292,16 +294,36 @@ for epoch in range(1, cfg.epochs + 1):
         xb = xb.to(device)
         yb = yb.to(device)
 
-        yhat, sym_pen = forward_with_invariance_penalty(
-            model=model,
-            X=active_fields,
-            x=xb,
-            loss=torch.nn.L1Loss(), #torch.nn.MSELoss(),
-            weights=weights
-        )
+        gamma = float(gamma_schedule(epoch))
+
+        if gamma!=0.0:
+            yhat, sym_pen = forward_with_equivariance_penalty(
+                model=model,
+                X_in=active_fields,
+                Y_out=active_fields,
+                x=xb,
+                loss=torch.nn.MSELoss(),
+                weights=weights
+            )
+            #yhat, sym_pen = forward_with_invariance_penalty(
+            #    model=model,
+            #    X=active_fields,
+            #    x=xb,
+            #    loss=torch.nn.MSELoss(), #torch.nn.L1Loss(), #
+            #    weights=weights
+            #)
+        else:
+            yhat, sym_pen = model(xb), torch.tensor(0.0)
 
         model_loss = model_criterion(yhat, yb)
-        loss = model_loss + sym_pen
+
+        if not penalties_scaled and gamma!=0.0:
+            scale = model_loss.detach()/torch.max(sym_pen.detach(), torch.tensor(1e-8))
+            penalties_scaled=True
+        else:
+            scale = 1.0
+
+        loss = (1-gamma)*model_loss + gamma*scale*sym_pen
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -313,18 +335,16 @@ for epoch in range(1, cfg.epochs + 1):
 
 
     if epoch % cfg.print_every == 0 or epoch == 1 or epoch == cfg.epochs:
-        print("Model loss: " , model_loss.detach())
-        print("Symmetry loss: ", sym_pen.detach())
+        print("Model loss: " , (1-gamma)*model_loss.detach())
+        print("Symmetry loss: ", gamma*scale*sym_pen.detach())
         train_metrics = evaluate(model, train_loader)
         test_metrics = evaluate(model, test_loader)
         print(f"[{epoch:03d}/{cfg.epochs}] "
               f"Train MSE: {train_metrics['MSE']:.4f}, R2: {train_metrics['R2']:.4f} | "
               f"Test MSE: {test_metrics['MSE']:.4f}, R2: {test_metrics['R2']:.4f} | "
-              f"λ_R01={cfg.lambda_R01:.2f}, λ_T2={cfg.lambda_T2:.2f}")
+              f"λ_R01={cfg.lambda_R01:.2f}")
 
-
-# now plot
-
+'''
 def plot_xy_projection_at_z0(
     model: nn.Module,
     X_np: np.ndarray,
@@ -368,8 +388,6 @@ X_all = np.vstack([X_train, X_test])  # or just X  # original numpy arrays
 plot_xy_projection_at_z0(model, X_all, title="ŷ at z=0 (train+test projection)")#, fname="xy_pred_z0.png")
 
 
-# now conduct symmetry discovery
-
 # Build evaluation set: train+test or just test to probe OOD symmetry
 X_eval_np = np.vstack([X_train, X_test]).astype(np.float32, copy=False)
 X_eval = torch.from_numpy(X_eval_np).to(device)
@@ -406,6 +424,130 @@ def print_top_components(C, names, topk=4):
         for idx in order[:topk]:
             print(f"  {names[idx]:>6s}: {coeffs[idx]: .4f}")
 
-print_top_components(C, names, topk=6)
+print_top_components(C, names, topk=6)'''
 
 
+### test on graph data
+
+# node_feature_generators.py
+# Build X1, X2, X3 for node features using your Killing fields API.
+
+from typing import Callable, Dict, Tuple, List
+#from symdisc import generate_euclidean_killing_fields_with_names  #
+
+# ------------- Coordinate indexing (0-based) -------------
+LABELS = [
+    "u11", "u12", "u13",
+    "u21", "u22", "u23",
+    "u31", "u32", "u33",
+    "T1", "T2", "T3",
+    "p1", "p2", "p3",
+]
+IDX: Dict[str, int] = {name: i for i, name in enumerate(LABELS)}
+
+def _pair(name_a: str, name_b: str) -> Tuple[int, int]:
+    i, j = IDX[name_a], IDX[name_b]
+    return (i, j) if i < j else (j, i)
+
+# ------------- Helper: combine a list of vector fields with coefficients -------------
+def _linear_combination(fields: List[Callable], coeffs: List[float] = None) -> Callable:
+    """
+    Return a batch-aware callable F such that F(x) = sum_k coeffs[k] * fields[k](x).
+    fields[k] follow your API: input shape (d,) -> (d,) or (N,d) -> (N,d).
+    """
+    if coeffs is None:
+        coeffs = [1.0] * len(fields)
+    assert len(coeffs) == len(fields)
+
+    def F(x):
+        out = None
+        for c, f in zip(coeffs, fields):
+            v = f(x)
+            out = v * c if out is None else out + v * c
+        return out
+
+    return F
+
+# ------------- Public factory -------------
+def build_node_generators(backend: str = "auto"):
+    """
+    Returns (X1, X2, X3), the 3 node-feature generators as callables.
+
+    Each callable matches the behavior of your original fields:
+      - x with shape (15,) -> (15,)
+      - X with shape (N,15) -> (N,15)
+    and dispatches to NumPy or Torch depending on backend='auto' and input type.
+    """
+    # Rotations only (avoid translations clutter), names like "R_i_j"
+    fields, names = generate_euclidean_killing_fields_with_names(
+        d=15,
+        include_translations=False,
+        include_rotations=True,
+        backend=backend,
+    )
+    name_to_field = {n: f for f, n in zip(fields, names)}
+
+    def R(i: int, j: int) -> Callable:
+        return name_to_field[f"R_{i}_{j}"] if i < j else name_to_field[f"R_{j}_{i}"]
+
+    # ---- X1 ----
+    X1_pairs = [
+        _pair("u13", "u23"),  # (2,5)
+        _pair("u12", "u22"),  # (1,4)
+        _pair("u21", "u22"),  # (3,4)
+        _pair("u11", "u21"),  # (0,3)
+        _pair("u11", "u12"),  # (0,1)
+        _pair("u31", "u32"),  # (6,7)
+        _pair("p1",  "p2"),   # (12,13)
+        _pair("T1",  "T2"),   # (9,10)
+    ]
+    X1_fields = [R(i, j) for (i, j) in X1_pairs]
+    X1 = _linear_combination(X1_fields)  # all coeffs = 1
+
+    # ---- X2 ----
+    X2_pairs = [
+        _pair("u21", "u23"),  # (3,5)
+        _pair("u11", "u13"),  # (0,2)
+        _pair("u13", "u33"),  # (2,8)
+        _pair("u31", "u33"),  # (6,8)
+        _pair("u12", "u32"),  # (1,7)
+        _pair("u11", "u31"),  # (0,6)
+        _pair("p1",  "p3"),   # (12,14)
+        _pair("T1",  "T3"),   # (9,11)
+    ]
+    X2_fields = [R(i, j) for (i, j) in X2_pairs]
+    X2 = _linear_combination(X2_fields)
+
+    # ---- X3 ----
+    X3_pairs = [
+        _pair("u22", "u23"),  # (4,5)
+        _pair("u12", "u13"),  # (1,2)
+        _pair("u23", "u33"),  # (5,8)
+        _pair("u32", "u33"),  # (7,8)
+        _pair("u22", "u32"),  # (4,7)
+        _pair("u21", "u31"),  # (3,6)
+        _pair("p2",  "p3"),   # (13,14)
+        _pair("T2",  "T3"),   # (10,11)
+    ]
+    X3_fields = [R(i, j) for (i, j) in X3_pairs]
+    X3 = _linear_combination(X3_fields)
+
+    return X1, X2, X3
+
+# Optional: export labels and indices if helpful upstream
+def node_feature_labels() -> List[str]:
+    return LABELS
+
+def node_feature_index(label: str) -> int:
+    return IDX[label]
+
+
+
+X1, X2, X3 = build_node_generators(backend="auto")
+
+import numpy as np
+x = np.random.randn(15)      # single node-feature vector
+dx1 = X1(x)                  # shape (15,)
+
+X = np.random.randn(5, 15)   # batch of 5
+dx2 = X2(X)                  # shape (5, 15)
