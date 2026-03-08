@@ -102,6 +102,7 @@ print(d5)
 print(t4-t3)
 '''
 
+'''
 # -------------------------
 # Reproducibility
 # -------------------------
@@ -343,6 +344,7 @@ for epoch in range(1, cfg.epochs + 1):
               f"Train MSE: {train_metrics['MSE']:.4f}, R2: {train_metrics['R2']:.4f} | "
               f"Test MSE: {test_metrics['MSE']:.4f}, R2: {test_metrics['R2']:.4f} | "
               f"λ_R01={cfg.lambda_R01:.2f}")
+'''
 
 '''
 def plot_xy_projection_at_z0(
@@ -429,125 +431,253 @@ print_top_components(C, names, topk=6)'''
 
 ### test on graph data
 
-# node_feature_generators.py
-# Build X1, X2, X3 for node features using your Killing fields API.
+# equivariance_generators.py
+# Unified, torch-native vector fields for node, edge, and output (Mendel) features.
+# Compatible with symdisc.enforcement.regularization.diagonal.{diagonalize, sum_fields}.
+#
+# Contents:
+#   - build_node_generators_vector_fields()  -> X1, X2, X3 on R^15
+#   - build_output_generators_vector_fields() -> Y1, Y2, Y3 on R^6
+#   - build_edge_generators_vector_fields()  -> (R_x, R_y, R_z) on R^3 (rotations)
+#
+# Notes:
+#   * We reuse your Euclidean Killing fields (rotations only).
+#   * We wrap them to accept tensors of shape (..., d) and a 'meta' kwarg.
+#   * These vector fields are ready to be 'diagonalize(...)'d along nodes/edges.
 
-from typing import Callable, Dict, Tuple, List
-#from symdisc import generate_euclidean_killing_fields_with_names  #
+#from __future__ import annotations
+#from typing import Callable, Optional, Dict, Tuple, List
+from math import sqrt
+#import torch
 
-# ------------- Coordinate indexing (0-based) -------------
-LABELS = [
-    "u11", "u12", "u13",
-    "u21", "u22", "u23",
-    "u31", "u32", "u33",
-    "T1", "T2", "T3",
-    "p1", "p2", "p3",
+# --- Reuse your diagonal utilities (no refactor needed) ---
+from symdisc.enforcement.regularization.diagonal import diagonalize, sum_fields  # noqa: F401
+
+# --- IMPORT YOUR KILLING FIELDS API ---
+# TODO: Adjust the import path below to where your generators live.
+# It must provide: generate_euclidean_killing_fields_with_names(d, include_translations, include_rotations, backend)
+try:
+    from symdisc import generate_euclidean_killing_fields_with_names  # type: ignore
+except Exception:
+    # Fallback: assume it's available in PYTHONPATH, update as appropriate.
+    from symdisc import generate_euclidean_killing_fields_with_names  # type: ignore
+
+
+VectorField = Callable[..., torch.Tensor]
+
+
+# -------------------------- Small wrapper helper -------------------------- #
+def _as_vector_field_lastdim(f_raw: Callable, d: int) -> VectorField:
+    """
+    Wrap a base Killing field 'f_raw' (expects (d,) or (N,d), returns same)
+    so it behaves as a VectorField on arbitrary torch tensors whose LAST dimension is d.
+    Signature becomes: f(x: torch.Tensor, *, meta=None) -> torch.Tensor
+    Preserves shape and dtype/device; ignores 'meta'.
+    """
+    def f(x: torch.Tensor, *, meta: Optional[Dict[str, object]] = None) -> torch.Tensor:
+        if not isinstance(x, torch.Tensor):
+            x = torch.as_tensor(x)
+        assert x.shape[-1] == d, f"Expected last dim={d}, got {x.shape[-1]}"
+        # fast paths for 1D/2D
+        if x.ndim == 1 or x.ndim == 2:
+            return f_raw(x)
+        # general: flatten leading dims, apply, reshape back
+        lead = x.shape[:-1]
+        x_flat = x.reshape(-1, d)
+        y_flat = f_raw(x_flat)
+        return y_flat.reshape(*lead, d)
+    return f
+
+
+# ======================= NODE FEATURE GENERATORS (R^15) ======================= #
+# Coordinate order: (u11,u12,u13,u21,u22,u23,u31,u32,u33, T1,T2,T3, p1,p2,p3)
+_NODE_LABELS = [
+    "u11","u12","u13",
+    "u21","u22","u23",
+    "u31","u32","u33",
+    "T1","T2","T3",
+    "p1","p2","p3",
 ]
-IDX: Dict[str, int] = {name: i for i, name in enumerate(LABELS)}
+_NODE_IDX: Dict[str, int] = {n: i for i, n in enumerate(_NODE_LABELS)}
 
-def _pair(name_a: str, name_b: str) -> Tuple[int, int]:
-    i, j = IDX[name_a], IDX[name_b]
+def _pair_node(a: str, b: str) -> Tuple[int, int]:
+    i, j = _NODE_IDX[a], _NODE_IDX[b]
     return (i, j) if i < j else (j, i)
 
-# ------------- Helper: combine a list of vector fields with coefficients -------------
-def _linear_combination(fields: List[Callable], coeffs: List[float] = None) -> Callable:
+def build_node_generators_vector_fields() -> Tuple[VectorField, VectorField, VectorField]:
     """
-    Return a batch-aware callable F such that F(x) = sum_k coeffs[k] * fields[k](x).
-    fields[k] follow your API: input shape (d,) -> (d,) or (N,d) -> (N,d).
+    Returns (X1, X2, X3) as torch VectorFields on R^15 with signature:
+        Xk(x: torch.Tensor, *, meta=None) -> torch.Tensor   (same shape as x)
+    They accept inputs of shape (..., 15).
+    Xk are linear combinations of rotation generators R_{i,j} you specified.
     """
-    if coeffs is None:
-        coeffs = [1.0] * len(fields)
-    assert len(coeffs) == len(fields)
-
-    def F(x):
-        out = None
-        for c, f in zip(coeffs, fields):
-            v = f(x)
-            out = v * c if out is None else out + v * c
-        return out
-
-    return F
-
-# ------------- Public factory -------------
-def build_node_generators(backend: str = "auto"):
-    """
-    Returns (X1, X2, X3), the 3 node-feature generators as callables.
-
-    Each callable matches the behavior of your original fields:
-      - x with shape (15,) -> (15,)
-      - X with shape (N,15) -> (N,15)
-    and dispatches to NumPy or Torch depending on backend='auto' and input type.
-    """
-    # Rotations only (avoid translations clutter), names like "R_i_j"
+    d = 15
     fields, names = generate_euclidean_killing_fields_with_names(
-        d=15,
-        include_translations=False,
-        include_rotations=True,
-        backend=backend,
+        d=d, include_translations=False, include_rotations=True, backend="torch"
     )
     name_to_field = {n: f for f, n in zip(fields, names)}
 
-    def R(i: int, j: int) -> Callable:
-        return name_to_field[f"R_{i}_{j}"] if i < j else name_to_field[f"R_{j}_{i}"]
+    def R(i: int, j: int) -> VectorField:
+        key = f"R_{i}_{j}" if i < j else f"R_{j}_{i}"
+        return _as_vector_field_lastdim(name_to_field[key], d=d)
 
-    # ---- X1 ----
-    X1_pairs = [
-        _pair("u13", "u23"),  # (2,5)
-        _pair("u12", "u22"),  # (1,4)
-        _pair("u21", "u22"),  # (3,4)
-        _pair("u11", "u21"),  # (0,3)
-        _pair("u11", "u12"),  # (0,1)
-        _pair("u31", "u32"),  # (6,7)
-        _pair("p1",  "p2"),   # (12,13)
-        _pair("T1",  "T2"),   # (9,10)
+    # X1: [R_{u13,u23}, R_{u12,u22}, R_{u21,u22}, R_{u11,u21}, R_{u11,u12}, R_{u31,u32}, R_{p1,p2}, R_{T1,T2}]
+    X1_parts = [
+        R(*_pair_node("u13","u23")),
+        R(*_pair_node("u12","u22")),
+        R(*_pair_node("u21","u22")),
+        R(*_pair_node("u11","u21")),
+        R(*_pair_node("u11","u12")),
+        R(*_pair_node("u31","u32")),
+        R(*_pair_node("p1","p2")),
+        R(*_pair_node("T1","T2")),
     ]
-    X1_fields = [R(i, j) for (i, j) in X1_pairs]
-    X1 = _linear_combination(X1_fields)  # all coeffs = 1
+    X1 = sum_fields(*X1_parts)
 
-    # ---- X2 ----
-    X2_pairs = [
-        _pair("u21", "u23"),  # (3,5)
-        _pair("u11", "u13"),  # (0,2)
-        _pair("u13", "u33"),  # (2,8)
-        _pair("u31", "u33"),  # (6,8)
-        _pair("u12", "u32"),  # (1,7)
-        _pair("u11", "u31"),  # (0,6)
-        _pair("p1",  "p3"),   # (12,14)
-        _pair("T1",  "T3"),   # (9,11)
+    # X2: [R_{u21,u23}, R_{u11,u13}, R_{u13,u33}, R_{u31,u33}, R_{u12,u32}, R_{u11,u31}, R_{p1,p3}, R_{T1,T3}]
+    X2_parts = [
+        R(*_pair_node("u21","u23")),
+        R(*_pair_node("u11","u13")),
+        R(*_pair_node("u13","u33")),
+        R(*_pair_node("u31","u33")),
+        R(*_pair_node("u12","u32")),
+        R(*_pair_node("u11","u31")),
+        R(*_pair_node("p1","p3")),
+        R(*_pair_node("T1","T3")),
     ]
-    X2_fields = [R(i, j) for (i, j) in X2_pairs]
-    X2 = _linear_combination(X2_fields)
+    X2 = sum_fields(*X2_parts)
 
-    # ---- X3 ----
-    X3_pairs = [
-        _pair("u22", "u23"),  # (4,5)
-        _pair("u12", "u13"),  # (1,2)
-        _pair("u23", "u33"),  # (5,8)
-        _pair("u32", "u33"),  # (7,8)
-        _pair("u22", "u32"),  # (4,7)
-        _pair("u21", "u31"),  # (3,6)
-        _pair("p2",  "p3"),   # (13,14)
-        _pair("T2",  "T3"),   # (10,11)
+    # X3: [R_{u22,u23}, R_{u12,u13}, R_{u23,u33}, R_{u32,u33}, R_{u22,u32}, R_{u21,u31}, R_{p2,p3}, R_{T2,T3}]
+    X3_parts = [
+        R(*_pair_node("u22","u23")),
+        R(*_pair_node("u12","u13")),
+        R(*_pair_node("u23","u33")),
+        R(*_pair_node("u32","u33")),
+        R(*_pair_node("u22","u32")),
+        R(*_pair_node("u21","u31")),
+        R(*_pair_node("p2","p3")),
+        R(*_pair_node("T2","T3")),
     ]
-    X3_fields = [R(i, j) for (i, j) in X3_pairs]
-    X3 = _linear_combination(X3_fields)
+    X3 = sum_fields(*X3_parts)
 
     return X1, X2, X3
 
-# Optional: export labels and indices if helpful upstream
-def node_feature_labels() -> List[str]:
-    return LABELS
 
-def node_feature_index(label: str) -> int:
-    return IDX[label]
+# =================== OUTPUT (MENDEL) GENERATORS (R^6) =================== #
+# Mendel order: (w1,w2,w3,w4,w5,w6) = (t11, t12, t13, t22, t23, t33)
+_MENDEL_LABELS = ["w1","w2","w3","w4","w5","w6"]
+_MENDEL_IDX: Dict[str, int] = {n: i for i, n in enumerate(_MENDEL_LABELS)}
+
+def _pair_mendel(a: str, b: str) -> Tuple[int, int]:
+    i, j = _MENDEL_IDX[a], _MENDEL_IDX[b]
+    return (i, j) if i < j else (j, i)
+
+def build_output_generators_vector_fields() -> Tuple[VectorField, VectorField, VectorField]:
+    """
+    Returns (Y1, Y2, Y3) as torch VectorFields on R^6 with signature:
+        Yk(x: torch.Tensor, *, meta=None) -> torch.Tensor
+    They accept inputs of shape (..., 6).
+    Uses your custom Mendel order and sqrt(2) weights as specified.
+    """
+    d = 6
+    fields, names = generate_euclidean_killing_fields_with_names(
+        d=d, include_translations=False, include_rotations=True, backend="torch"
+    )
+    name_to_field = {n: f for f, n in zip(fields, names)}
+
+    def R(i: int, j: int) -> VectorField:
+        key = f"R_{i}_{j}" if i < j else f"R_{j}_{i}"
+        return _as_vector_field_lastdim(name_to_field[key], d=d)
+
+    s2 = sqrt(2.0)
+
+    # Y1: [sqrt(2)*R_{w2,w4}, sqrt(2)*R_{w1,w2}, R_{w3,w5}]
+    Y1 = sum_fields(
+        R(*_pair_mendel("w2","w4")),
+        R(*_pair_mendel("w1","w2")),
+        R(*_pair_mendel("w3","w5")),
+        weights=[s2, s2, 1.0],
+    )
+
+    # Y2: [sqrt(2)*R_{w1,w3}, sqrt(2)*R_{w3,w6}, R_{w2,w5}]
+    Y2 = sum_fields(
+        R(*_pair_mendel("w1","w3")),
+        R(*_pair_mendel("w3","w6")),
+        R(*_pair_mendel("w2","w5")),
+        weights=[s2, s2, 1.0],
+    )
+
+    # Y3: [sqrt(2)*R_{w4,w5}, sqrt(2)*R_{w5,w6}, R_{w2,w3}]
+    Y3 = sum_fields(
+        R(*_pair_mendel("w4","w5")),
+        R(*_pair_mendel("w5","w6")),
+        R(*_pair_mendel("w2","w3")),
+        weights=[s2, s2, 1.0],
+    )
+
+    return Y1, Y2, Y3
 
 
+# ===================== EDGE (RELATIVE VECTOR) GENERATORS (R^3) ===================== #
+def build_edge_generators_vector_fields() -> Tuple[VectorField, VectorField, VectorField]:
+    """
+    Returns the 3 rotational generators on R^3 (about x, y, z), ready for edges r_ij.
+    Signature: Ek(r: torch.Tensor, *, meta=None) -> torch.Tensor, shape-preserving for (..., 3).
+    Mapping from R_{i,j} to axes:
+        R_{1,2} -> rotation about x-axis  (δ = (0, -z, y))
+        R_{0,2} -> rotation about y-axis  (δ = (-z, 0, x))
+        R_{0,1} -> rotation about z-axis  (δ = (-y, x, 0))
+    """
+    d = 3
+    fields, names = generate_euclidean_killing_fields_with_names(
+        d=d, include_translations=False, include_rotations=True, backend="torch"
+    )
+    name_to_field = {n: f for f, n in zip(fields, names)}
 
-X1, X2, X3 = build_node_generators(backend="auto")
+    def R(i: int, j: int) -> VectorField:
+        key = f"R_{i}_{j}" if i < j else f"R_{j}_{i}"
+        return _as_vector_field_lastdim(name_to_field[key], d=d)
 
-import numpy as np
-x = np.random.randn(15)      # single node-feature vector
-dx1 = X1(x)                  # shape (15,)
+    # About x, y, z respectively:
+    E_x = R(1, 2)
+    E_y = R(0, 2)
+    E_z = R(0, 1)
+    return E_x, E_y, E_z
 
-X = np.random.randn(5, 15)   # batch of 5
-dx2 = X2(X)                  # shape (5, 15)
+
+# ================================ EXAMPLES ================================ #
+# (Keep here or move to tests.)
+#
+# >>> X1, X2, X3 = build_node_generators_vector_fields()
+# >>> x_nodes = torch.randn(8, 120, 15)  # (B, N_nodes, 15)
+# >>> X1_per_node = diagonalize(X1, along=1)
+# >>> dx = X1_per_node(x_nodes)  # (B, N_nodes, 15)
+#
+# >>> Y1, Y2, Y3 = build_output_generators_vector_fields()
+# >>> y = torch.randn(8, 6)      # (B, 6) single output per graph
+# >>> dy = Y2(y)                 # (B, 6)
+#
+# >>> E_x, E_y, E_z = build_edge_generators_vector_fields()
+# >>> r = torch.randn(8, 500, 3)  # (B, E, 3) edge relative vectors
+# >>> E_y_per_edge = diagonalize(E_y, along=1)
+# >>> dr = E_y_per_edge(r)        # (B, E, 3)
+
+###########################################################################
+
+X1, X2, X3 = build_node_generators_vector_fields()
+x_nodes = torch.randn(8, 120, 15)  # (B, N_nodes, 15)
+X1_per_node = diagonalize(X1, along=1)
+dx = X1_per_node(x_nodes)  # (B, N_nodes, 15)
+
+Y1, Y2, Y3 = build_output_generators_vector_fields()
+y = torch.randn(8, 6)      # (B, 6) single output per graph
+dy = Y2(y)                 # (B, 6)
+
+E_x, E_y, E_z = build_edge_generators_vector_fields()
+r = torch.randn(8, 500, 3)  # (B, E, 3) edge relative vectors
+E_y_per_edge = diagonalize(E_y, along=1)
+dr = E_y_per_edge(r)        # (B, E, 3)
+
+print(dx)
+print(dy)
+print(dr)
