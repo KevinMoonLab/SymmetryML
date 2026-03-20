@@ -2,17 +2,19 @@
 from __future__ import annotations
 from typing import Callable, Optional, Dict, Any, Iterable, Sequence, Tuple, List
 import torch
+from symdisc.enforcement.regularization.utilities import _maybe_call_field
 
 VectorField = Callable[..., torch.Tensor]
 
 def diagonalize(base: VectorField, *, along: int) -> VectorField:
     """Apply `base` independently along dimension `along`."""
-    def X(x: torch.Tensor, *, meta: Optional[Dict[str, Any]] = None) -> torch.Tensor:
+    def X(x: torch.Tensor, *, meta: Optional[Dict[str, Any]] = None,
+          grad: Optional[torch.Tensor] = None) -> torch.Tensor:
         # Move target dim to front, apply base, move back.
         x_perm = x.movedim(along, 0)
         outs = []
         for xi in x_perm:  # simple, safe; can optimize to vmap later
-            outs.append(base(xi, meta=meta))
+            outs.append(_maybe_call_field(base, xi, meta=meta, grad=grad))
         return torch.stack(outs, dim=0).movedim(0, along)
     return X
 
@@ -37,10 +39,11 @@ def sum_fields(*fields: Iterable[VectorField], weights: Optional[Sequence[float]
     if weights is not None:
         ws = torch.as_tensor(weights, dtype=torch.float32)
 
-    def X(x: torch.Tensor, *, meta: Optional[Dict[str, Any]] = None) -> torch.Tensor:
+    def X(x: torch.Tensor, *, meta: Optional[Dict[str, Any]] = None,
+          grad: Optional[torch.Tensor] = None) -> torch.Tensor:
         acc = None
         for i, f in enumerate(fields):
-            v = f(x, meta=meta)
+            v = _maybe_call_field(f, x, meta=meta)
             if ws is not None:
                 v = v * ws[i]
             acc = v if acc is None else acc + v
@@ -48,11 +51,55 @@ def sum_fields(*fields: Iterable[VectorField], weights: Optional[Sequence[float]
     return X
 
 # ===========================================================================
-# Generic glue (to move to diagonal.py) – Pattern B: flat segments
+# Generic glue (to move to diagonal.py) – flat segments
 # ===========================================================================
 
-VectorField = Callable[..., torch.Tensor]
+def pack_flat(x_nodes: torch.Tensor, e_edges: torch.Tensor) -> torch.Tensor:
+    """
+    x_nodes: (B, N, Cn)
+    e_edges: (B, E, Ce)
+    -> (B, N*Cn + E*Ce)
+    """
+    assert x_nodes.ndim == 3 and e_edges.ndim == 3, "Expected (B,N,Cn) and (B,E,Ce)"
+    B1, N, Cn = x_nodes.shape
+    B2, E, Ce = e_edges.shape
+    if B1 != B2:
+        raise ValueError(f"Batch mismatch: x_nodes B={B1}, e_edges B={B2}")
+    return torch.cat([x_nodes.reshape(B1, N*Cn),
+                      e_edges.reshape(B1, E*Ce)], dim=-1)
 
+def unpack_flat(x_flat: torch.Tensor, N: int, E: int, *, node_dim: int, edge_dim: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    x_flat: (B, N*node_dim + E*edge_dim)
+    -> (x_nodes: (B,N,node_dim), e_edges: (B,E,edge_dim))
+    """
+    assert x_flat.ndim == 2, "Expected (B, total)"
+    B = x_flat.shape[0]
+    nodes_end = N * node_dim
+    total_needed = nodes_end + E * edge_dim
+    if x_flat.shape[1] < total_needed:
+        raise ValueError(f"unpack_flat_generic needs at least {total_needed} columns, got {x_flat.shape[1]}")
+    x_nodes = x_flat[:, :nodes_end].reshape(B, N, node_dim)
+    e_edges = x_flat[:, nodes_end:nodes_end + E*edge_dim].reshape(B, E, edge_dim)
+    return x_nodes, e_edges
+
+def build_flat_mask(mask_nodes: torch.Tensor, mask_edges: torch.Tensor, *,
+                            node_dim: int, edge_dim: int) -> torch.Tensor:
+    """
+    mask_nodes: (B, N, 1)
+    mask_edges: (B, E, 1)
+    -> (B, N*node_dim + E*edge_dim)
+    """
+    assert mask_nodes.ndim == 3 and mask_edges.ndim == 3, "Expected (B,N,1) and (B,E,1)"
+    B1, N, _ = mask_nodes.shape
+    B2, E, _ = mask_edges.shape
+    if B1 != B2:
+        raise ValueError(f"Batch mismatch: mask_nodes B={B1}, mask_edges B={B2}")
+    m_nodes = mask_nodes.expand(B1, N, node_dim).reshape(B1, N*node_dim)
+    m_edges = mask_edges.expand(B1, E, edge_dim).reshape(B1, E*edge_dim)
+    return torch.cat([m_nodes, m_edges], dim=-1)
+
+'''
 def pack_flat(x_nodes: torch.Tensor, e_edges: torch.Tensor) -> torch.Tensor:
     """
     x_nodes: (B, N, 15)
@@ -84,7 +131,7 @@ def build_flat_mask(mask_nodes: torch.Tensor, mask_edges: torch.Tensor) -> torch
     m_nodes = mask_nodes.expand(B, N, 15).reshape(B, N*15)
     m_edges = mask_edges.expand(B, E, 3).reshape(B, E*3)
     return torch.cat([m_nodes, m_edges], dim=-1)
-
+'''
 def lift_field_to_flat_segment(base: VectorField, *, count: int, dim: int, offset: int) -> VectorField:
     """
     Lift a base field (lastdim==dim) to act on a flat packed (B, total_dim),
@@ -95,7 +142,7 @@ def lift_field_to_flat_segment(base: VectorField, *, count: int, dim: int, offse
         B = x.shape[0]
         seg = x[..., offset: offset + count*dim].reshape(B, count, dim)
         diag_base = diagonalize(base, along=1)
-        v_seg = diag_base(seg, meta=meta)
+        v_seg = diag_base(seg, meta=meta, grad=grad)
         v = torch.zeros_like(x)
         v[..., offset: offset + count*dim] = v_seg.reshape(B, count*dim)
         return v

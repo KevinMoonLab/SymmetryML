@@ -1,14 +1,10 @@
-# train_mandel_graphs.py
-
+# train_squareduct_2d_mandel.py
 from __future__ import annotations
+import math, time, csv, json, argparse
+from pathlib import Path
+from typing import List, Tuple, Optional, Sequence, Dict, Callable
 
-import math
-import random
-import time
-import csv
-from dataclasses import dataclass
-from typing import List, Tuple, Optional, Callable, Sequence
-
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -16,16 +12,23 @@ from torch.utils.data import Dataset, DataLoader
 
 # --- symdisc imports (unchanged) ---
 from symdisc import generate_euclidean_killing_fields_with_names
-from symdisc.enforcement.regularization.diagonal import diagonalize, sum_fields, pack_flat, build_flat_mask, \
-    lift_field_to_flat_segment, unpack_flat
+from symdisc.enforcement.regularization.diagonal import (
+    sum_fields, pack_flat, build_flat_mask, lift_field_to_flat_segment, unpack_flat
+)
 from symdisc.enforcement.regularization.penalties import (
     forward_with_equivariance_penalty
 )
+from symdisc.enforcement.regularization.utilities import (
+    as_field_lastdim, make_pairer
+)
+
+from symdisc.enforcement.regularization import schedules as S
 
 # ---------------------------------------------------------------------------
 # Reproducibility
 # ---------------------------------------------------------------------------
 def set_seed(seed: int = 1337):
+    import random
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -35,436 +38,156 @@ def set_seed(seed: int = 1337):
 set_seed(1337)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-
-# ===========================================================================
-# Vector-field builders (nodes/edges/output)
-# ===========================================================================
-
-# Small helper to wrap a base field to last-dim tensors
-def _as_vector_field_lastdim(f_raw: Callable, d: int) -> Callable[..., torch.Tensor]:
-    def f(x: torch.Tensor, *, meta: Optional[dict] = None) -> torch.Tensor:
-        if not isinstance(x, torch.Tensor):
-            x = torch.as_tensor(x)
-        assert x.shape[-1] == d, f"Expected last dim={d}, got {x.shape[-1]}"
-        if x.ndim <= 2:
-            return f_raw(x)
-        lead = x.shape[:-1]
-        x_flat = x.reshape(-1, d)
-        y_flat = f_raw(x_flat)
-        return y_flat.reshape(*lead, d)
-    return f
-
-# ----- Node fields on R^15 in canonical order: [p(3), T(3), grad_u(9)]
-_NODE_LABELS = [
-    "p1","p2","p3",
-    "T1","T2","T3",
-    "u11","u12","u13",
-    "u21","u22","u23",
-    "u31","u32","u33",
-]
-_NODE_IDX = {n: i for i, n in enumerate(_NODE_LABELS)}
-def _pair_node(a: str, b: str) -> Tuple[int, int]:
-    i, j = _NODE_IDX[a], _NODE_IDX[b]
-    return (i, j) if i < j else (j, i)
-
-def build_node_generators_vector_fields() -> Tuple[Callable, Callable, Callable]:
-    d = 15
-    fields, names = generate_euclidean_killing_fields_with_names(
-        d=d, include_translations=False, include_rotations=True, backend="torch"
-    )
-    name_to_field = {n: f for f, n in zip(fields, names)}
-
-    def R(i: int, j: int):
-        key = f"R_{i}_{j}" if i < j else f"R_{j}_{i}"
-        return _as_vector_field_lastdim(name_to_field[key], d=d)
-
-    # Your linear combos (labels map correctly now that _NODE_LABELS is canonical)
-    X1 = sum_fields(
-        R(*_pair_node("u13","u23")),
-        R(*_pair_node("u12","u22")),
-        R(*_pair_node("u21","u22")),
-        R(*_pair_node("u11","u21")),
-        R(*_pair_node("u11","u12")),
-        R(*_pair_node("u31","u32")),
-        R(*_pair_node("p1","p2")),
-        R(*_pair_node("T1","T2")),
-    )
-    X2 = sum_fields(
-        R(*_pair_node("u21","u23")),
-        R(*_pair_node("u11","u13")),
-        R(*_pair_node("u13","u33")),
-        R(*_pair_node("u31","u33")),
-        R(*_pair_node("u12","u32")),
-        R(*_pair_node("u11","u31")),
-        R(*_pair_node("p1","p3")),
-        R(*_pair_node("T1","T3")),
-    )
-    X3 = sum_fields(
-        R(*_pair_node("u22","u23")),
-        R(*_pair_node("u12","u13")),
-        R(*_pair_node("u23","u33")),
-        R(*_pair_node("u32","u33")),
-        R(*_pair_node("u22","u32")),
-        R(*_pair_node("u21","u31")),
-        R(*_pair_node("p2","p3")),
-        R(*_pair_node("T2","T3")),
-    )
-    return X1, X2, X3
-
-# ----- Output (Mandel) on R^6 in order [A11,√2 s12,√2 s13, A22,√2 s23, A33]
-_MENDEL_LABELS = ["w1","w2","w3","w4","w5","w6"]
-_MENDEL_IDX = {n: i for i, n in enumerate(_MENDEL_LABELS)}
-def _pair_mendel(a: str, b: str) -> Tuple[int, int]:
-    i, j = _MENDEL_IDX[a], _MENDEL_IDX[b]
-    return (i, j) if i < j else (j, i)
-
-def build_output_generators_vector_fields() -> Tuple[Callable, Callable, Callable]:
-    d = 6
-    fields, names = generate_euclidean_killing_fields_with_names(
-        d=d, include_translations=False, include_rotations=True, backend="torch"
-    )
-    name_to_field = {n: f for f, n in zip(fields, names)}
-    def R(i: int, j: int):
-        key = f"R_{i}_{j}" if i < j else f"R_{j}_{i}"
-        return _as_vector_field_lastdim(name_to_field[key], d=d)
-
-    s2 = math.sqrt(2.0)
-    Y1 = sum_fields(
-        R(*_pair_mendel("w2","w4")),
-        R(*_pair_mendel("w1","w2")),
-        R(*_pair_mendel("w3","w5")),
-        weights=[s2, s2, 1.0],
-    )
-    Y2 = sum_fields(
-        R(*_pair_mendel("w1","w3")),
-        R(*_pair_mendel("w3","w6")),
-        R(*_pair_mendel("w2","w5")),
-        weights=[s2, s2, 1.0],
-    )
-    Y3 = sum_fields(
-        R(*_pair_mendel("w4","w5")),
-        R(*_pair_mendel("w5","w6")),
-        R(*_pair_mendel("w2","w3")),
-        weights=[s2, s2, 1.0],
-    )
-    return Y1, Y2, Y3
-
-# ----- Edge relative vectors on R^3 (rotations about x,y,z)
-def build_edge_generators_vector_fields() -> Tuple[Callable, Callable, Callable]:
-    d = 3
-    fields, names = generate_euclidean_killing_fields_with_names(
-        d=d, include_translations=False, include_rotations=True, backend="torch"
-    )
-    name_to_field = {n: f for f, n in zip(fields, names)}
-    def R(i: int, j: int):
-        key = f"R_{i}_{j}" if i < j else f"R_{j}_{i}"
-        return _as_vector_field_lastdim(name_to_field[key], d=d)
-    E_x = R(1, 2)  # about x
-    E_y = R(0, 2)  # about y
-    E_z = R(0, 1)  # about z
-    return E_x, E_y, E_z
-
-
-# ===========================================================================
-# Toy data: 3x3x3 grid, regime-aware node features, star edges, radial target
-# ===========================================================================
-
-def build_grid_coords():
-    xs = [-1., 0., 1.]
-    coords = []
-    for z in xs:
-        for y in xs:
-            for x in xs:
-                coords.append([x, y, z])
-    coords = torch.tensor(coords, dtype=torch.float)  # (27,3)
-    center_idx = ((coords == torch.tensor([0.,0.,0.])).all(dim=1)).nonzero(as_tuple=True)[0].item()
-    return coords, center_idx
-
-def build_star_edges(num_nodes: int, center_idx: int, directed_to_center: bool = True):
-    edge_index = []
-    for i in range(num_nodes):
-        if i == center_idx:
-            continue
-        if directed_to_center:
-            edge_index.append([i, center_idx])
-        else:
-            edge_index.append([i, center_idx]); edge_index.append([center_idx, i])
-    if len(edge_index) == 0:
-        return torch.empty((2,0), dtype=torch.long)
-    return torch.tensor(edge_index, dtype=torch.long).t().contiguous()  # (2,E)
-
-def _normalize(v: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
-    return v / (v.norm(dim=-1, keepdim=True) + eps)
-
-def _approx_vMF(mu: torch.Tensor, kappa: float, n: int, device) -> torch.Tensor:
-    mu = mu.to(device).view(1, 3).expand(n, 3)
-    noise = torch.randn(n, 3, device=device)
-    return _normalize(mu + (1.0 / max(kappa, 1e-3)) * noise)
-
-def _skew_from_axis(axis: torch.Tensor, omega: torch.Tensor) -> torch.Tensor:
-    a = _normalize(axis.view(1, 3)).expand(omega.shape[0], 3)
-    ax, ay, az = a[:,0], a[:,1], a[:,2]
-    zero = torch.zeros_like(ax)
-    K = torch.stack([
-        torch.stack([ zero, -az,   ay], dim=-1),
-        torch.stack([  az,  zero, -ax], dim=-1),
-        torch.stack([ -ay,   ax,  zero], dim=-1),
-    ], dim=1)  # (N,3,3)
-    return omega.view(-1,1,1) * K
-
-def _sym_from_axis(axis: torch.Tensor, eps: torch.Tensor) -> torch.Tensor:
-    N = eps.shape[0]
-    a = _normalize(axis.view(1, 3)).expand(N, 3)
-    mask = (a[:,0].abs() > 0.9).unsqueeze(1).expand(N, 3)
-    e1 = torch.tensor([1.,0.,0.], device=a.device).view(1,3).expand(N,3)
-    e2 = torch.tensor([0.,1.,0.], device=a.device).view(1,3).expand(N,3)
-    b  = torch.where(mask, e2, e1)
-    u = _normalize(torch.linalg.cross(a, b))
-    v = _normalize(torch.linalg.cross(a, u))
-    B = torch.stack([u, a, v], dim=-1)  # (N,3,3)
-
-    D = torch.zeros(N,3,3, device=a.device)
-    D[:,0,0] = -0.5 * eps
-    D[:,1,1] = eps
-    D[:,2,2] = -0.5 * eps
-    return B @ D @ B.transpose(1,2)
-
-def _missing_prob_from_coords(coords: torch.Tensor, pattern: str) -> torch.Tensor:
-    x, y, z = coords[:,0], coords[:,1], coords[:,2]
-    abs_sum = x.abs() + y.abs() + z.abs()
-    if pattern == "prefer_corners":
-        p = (abs_sum == 3).float() * 1.0 + (abs_sum == 2).float() * 0.5 + (abs_sum == 1).float() * 0.1
-    elif pattern == "prefer_faces":
-        p = (abs_sum == 1).float() * 1.0 + (abs_sum == 2).float() * 0.5 + (abs_sum == 3).float() * 0.1
-    else:
-        p = torch.ones_like(x)
-    return p
-
-@dataclass
-class RegimeConfig:
-    mu_p: torch.Tensor
-    mu_t: torch.Tensor
-    kappa_vec: float = 3.0
-    t2_sign: str = "positive"
-    skew_axis: torch.Tensor = torch.tensor([0., 1., 0.])
-    skew_mag: float = 0.5
-    sym_axis: torch.Tensor = torch.tensor([0., 1., 0.])
-    sym_mag: float = 0.4
-    sym_variant: str = "axis_y"
-    grad_u_noise: float = 0.2
-    missing_pattern: str = "uniform"
-
-def sample_node_features_regime(num_nodes: int, regime: RegimeConfig, device: torch.device):
-    N = num_nodes
-    mag_p = torch.randn(N, 1, device=device).abs() + 0.5
-    mag_t = torch.randn(N, 1, device=device).abs() + 0.5
-    p = mag_p * _approx_vMF(regime.mu_p.to(device), regime.kappa_vec, N, device)
-    t = mag_t * _approx_vMF(regime.mu_t.to(device), regime.kappa_vec, N, device)
-    if regime.t2_sign == "positive":
-        t[:,1] = t[:,1].abs() + 1e-3
-    elif regime.t2_sign == "negative":
-        t[:,1] = -(t[:,1].abs() + 1e-3)
-    else:
-        raise ValueError("t2_sign must be 'positive' or 'negative'")
-
-    omega = torch.randn(N, device=device) * (regime.skew_mag * 0.5) + regime.skew_mag
-    W = _skew_from_axis(regime.skew_axis.to(device), omega)
-    if regime.sym_variant == "axis_y":
-        axis = torch.tensor([0.,1.,0.], device=device)
-    elif regime.sym_variant == "axis_x":
-        axis = torch.tensor([1.,0.,0.], device=device)
-    elif regime.sym_variant == "flip":
-        axis = -regime.sym_axis.to(device)
-    else:
-        axis = regime.sym_axis.to(device)
-    eps = torch.randn(N, device=device) * (regime.sym_mag * 0.5) + regime.sym_mag
-    S = _sym_from_axis(axis, eps)
-    G = S + W + torch.randn(N,3,3, device=device) * regime.grad_u_noise
-
-    x = torch.zeros(N, 15, device=device)
-    x[:,0:3] = p
-    x[:,3:6] = t
-    x[:,6:15] = G.view(N, 9)
-    return x
-
-def F_mandel_per_node(x: torch.Tensor) -> torch.Tensor:
-    p = x[:, 0:3]
-    t = x[:, 3:6]
-    u = x[:, 6:15]
-    u11,u12,u13,u21,u22,u23,u31,u32,u33 = [u[:, i] for i in range(9)]
-    s11, s22, s33 = u11, u22, u33
-    s12 = 0.5 * (u12 + u21)
-    s13 = 0.5 * (u13 + u31)
-    s23 = 0.5 * (u23 + u32)
-    c = (p**2).sum(dim=1) + (t**2).sum(dim=1)
-    A11, A22, A33 = s11 + c, s22 + c, s33 + c
-    s2 = math.sqrt(2.0)
-    return torch.stack([A11, s2*s12, s2*s13, A22, s2*s23, A33], dim=1)
-
-def radial_weights(distances: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
-    return torch.exp(- (distances**2) / (sigma**2))
-
-def graph_target_from_nodes(coords: torch.Tensor, center_idx: int, F_nodes: torch.Tensor, sigma: float = 1.0) -> torch.Tensor:
-    center = coords[center_idx]
-    d = torch.linalg.norm(coords - center[None, :], dim=1)
-    w = radial_weights(d, sigma=sigma)
-    w = w / (w.sum() + 1e-12)
-    return (w[:, None] * F_nodes).sum(dim=0)
-
-def prune_nodes_with_pattern(coords: torch.Tensor, center_idx: int, max_missing: int, pattern: str, rng: random.Random):
-    N = coords.shape[0]
-    cand = [i for i in range(N) if i != center_idx]
-    k = rng.randint(0, max_missing)
-    if k == 0:
-        keep_mask = torch.ones(N, dtype=torch.bool); keep_mask[center_idx] = True
-        return coords, center_idx, keep_mask
-    probs = _missing_prob_from_coords(coords, pattern)
-    probs[center_idx] = 0.0
-    p = probs[cand]
-    p = (p / p.sum().clamp_min(1e-8)).cpu().numpy()
-    missing = set(rng.choices(cand, weights=p.tolist(), k=k))
-    keep_mask = torch.ones(N, dtype=torch.bool)
-    for i in missing:
-        keep_mask[i] = False
-    pruned = coords[keep_mask]
-    new_center_idx = ((pruned == torch.tensor([0.,0.,0.])).all(dim=1)).nonzero(as_tuple=True)[0].item()
-    return pruned, new_center_idx, keep_mask
-
-@dataclass
-class GraphSample:
-    coords: torch.Tensor      # (N,3)
-    center_idx: int
-    edge_index: torch.Tensor  # (2,E)
-    edge_attr: torch.Tensor   # (E,3) relative vectors node->center
-    x: torch.Tensor           # (N,15)
-    y: torch.Tensor           # (6,)
-
-class MandelStarDataset(Dataset):
+# ======================================================================
+# Data: load NPZ pack (one cross-section). Build a star per center node.
+# ======================================================================
+class StarGraph:
     def __init__(self,
-                 num_graphs: int,
-                 regime: RegimeConfig,
-                 max_missing: int = 6,
-                 sigma: float = 1.0,
-                 seed: int = 13,
-                 device: torch.device = torch.device("cpu")):
+                 coords: torch.Tensor,      # (n_star, 2)
+                 center_idx: int,           # index within the star (always 0 by construction)
+                 edge_index: torch.Tensor,  # (2, E) neighbors -> center
+                 edge_attr: torch.Tensor,   # (E, 2) relative vectors
+                 x: torch.Tensor,           # (n_star, 9)
+                 y: torch.Tensor):          # (6,)
+        self.coords = coords
+        self.center_idx = center_idx
+        self.edge_index = edge_index
+        self.edge_attr = edge_attr
+        self.x = x
+        self.y = y
+
+def _load_npz(npz_path: Path) -> Dict[str, np.ndarray]:
+    z = np.load(npz_path, allow_pickle=True)
+    return {k: z[k] for k in z.files}
+
+class SquareDuctStars(Dataset):
+    """
+    For a given NPZ (one Re case at one r), create one StarGraph per node.
+    Split: "upper" => centers with y>=0, "lower" => y<0.
+    """
+    def __init__(self, npz_paths: Sequence[Path], split: str):
         super().__init__()
-        rng = random.Random(seed)
-        torch_state = torch.random.get_rng_state()
-        self.samples: List[GraphSample] = []
-        for _ in range(num_graphs):
-            base_coords, base_center = build_grid_coords()
-            coords, center_idx, keep_mask = prune_nodes_with_pattern(
-                base_coords, base_center, max_missing=max_missing,
-                pattern=regime.missing_pattern, rng=rng
-            )
+        assert split in ("upper", "lower")
+        self.samples: List[StarGraph] = []
+        for pth in npz_paths:
+            blob = _load_npz(Path(pth))
+            coords = torch.tensor(blob["coords"], dtype=torch.float32)       # (N,2)
+            X = torch.tensor(blob["X"], dtype=torch.float32)                 # (N,9)
+            Y = torch.tensor(blob["Y"], dtype=torch.float32)                 # (N,6)
+            neighbors = blob["neighbors"]                                    # (N,) object arrays of int
+            edge_rel = blob["edge_rel"]                                      # (N,) object arrays of (deg,2) float
+
             N = coords.shape[0]
-            edge_index = build_star_edges(N, center_idx, directed_to_center=True)
-            if edge_index.numel() == 0:
-                edge_attr = torch.zeros((0, 3), dtype=torch.float)
-            else:
-                src = edge_index[0]; dst = edge_index[1]
-                edge_attr = coords[dst] - coords[src]  # relative node->center
-            x = sample_node_features_regime(N, regime=regime, device=device)
-            F_nodes = F_mandel_per_node(x)
-            y = graph_target_from_nodes(coords, center_idx, F_nodes, sigma=sigma)
-            self.samples.append(GraphSample(coords=coords,
-                                            center_idx=center_idx,
-                                            edge_index=edge_index,
-                                            edge_attr=edge_attr,
-                                            x=x,
-                                            y=y))
-        torch.random.set_rng_state(torch_state)
+            for i in range(N):
+                y_center = coords[i, 0]  # coords[:,0] is 'y'
+                if split == "upper" and (y_center < 0):
+                    continue
+                if split == "lower" and (y_center >= 0):
+                    continue
+
+                nbr_idx = neighbors[i]      # 1-D ndarray of ints
+                if nbr_idx is None or len(nbr_idx) == 0:
+                    # deg=0: still build a trivial star
+                    sub_nodes = torch.tensor([i], dtype=torch.long)
+                    sub_coords = coords[sub_nodes]
+                    sub_X = X[sub_nodes]
+                    y = Y[i]
+                    edge_index = torch.zeros((2,0), dtype=torch.long)
+                    edge_attr = torch.zeros((0,2), dtype=torch.float32)
+                    self.samples.append(
+                        StarGraph(sub_coords, center_idx=0,
+                                  edge_index=edge_index, edge_attr=edge_attr,
+                                  x=sub_X, y=y)
+                    )
+                    continue
+
+                # build star node list: center first, then neighbors
+                nbr_idx = torch.tensor(nbr_idx, dtype=torch.long)
+                sub_nodes = torch.cat([torch.tensor([i], dtype=torch.long), nbr_idx], dim=0)
+                # gather
+                sub_coords = coords[sub_nodes]           # (1+deg, 2)
+                sub_X = X[sub_nodes]                     # (1+deg, 9)
+                y = Y[i]                                 # (6,)
+                # edges: neighbor k -> center (index 0 in the subgraph)
+                E = nbr_idx.shape[0]
+                edge_index = torch.stack([torch.arange(1, 1+E, dtype=torch.long),
+                                          torch.zeros(E, dtype=torch.long)], dim=0)
+                # edge_attr: relative vectors from neighbor to center (already provided per center)
+                e_rel = torch.tensor(edge_rel[i], dtype=torch.float32)       # (E,2)
+                assert e_rel.shape[0] == E
+                self.samples.append(
+                    StarGraph(sub_coords, center_idx=0,
+                              edge_index=edge_index, edge_attr=e_rel,
+                              x=sub_X, y=y)
+                )
 
     def __len__(self): return len(self.samples)
     def __getitem__(self, idx): return self.samples[idx]
 
-def build_train_test_datasets(device=torch.device("cpu"),
-                              total_graphs: int = 200,
-                              max_missing: int = 6,
-                              sigma: float = 1.0,
-                              seed: int = 13):
-    assert total_graphs % 2 == 0
-    half = total_graphs // 2
-    train_regime = RegimeConfig(
-        mu_p=torch.tensor([0.,1.,0.]), mu_t=torch.tensor([0.,1.,0.]),
-        kappa_vec=3.0, t2_sign="positive",
-        skew_axis=torch.tensor([0.,1.,0.]), skew_mag=0.5,
-        sym_axis=torch.tensor([0.,1.,0.]), sym_mag=0.4,
-        sym_variant="axis_y", grad_u_noise=0.2,
-        missing_pattern="prefer_corners",
-    )
-    test_regime = RegimeConfig(
-        mu_p=torch.tensor([1.,0.,0.]), mu_t=torch.tensor([1.,0.,0.]),
-        kappa_vec=3.0, t2_sign="negative",
-        skew_axis=torch.tensor([0.,-1.,0.]), skew_mag=0.5,
-        sym_axis=torch.tensor([1.,0.,0.]), sym_mag=0.4,
-        sym_variant="axis_x", grad_u_noise=0.2,
-        missing_pattern="prefer_faces",
-    )
-    train_ds = MandelStarDataset(half, regime=train_regime, max_missing=max_missing, sigma=sigma, seed=seed,   device=device)
-    test_ds  = MandelStarDataset(half, regime=test_regime,  max_missing=max_missing, sigma=sigma, seed=seed+1, device=device)
-    return train_ds, test_ds
+# ----------------------------
+# Generic collate (list passthrough)
+# ----------------------------
+def collate_list(batch: List[StarGraph]):
+    return batch
 
-def pad_batch_graphs(batch: List[GraphSample]):
+# ----------------------------
+# Generic padder to run batched forward
+# ----------------------------
+def pad_batch_stars(batch: List[StarGraph]):
     """
-    Generic (not star-specific) padding.
     Returns:
-        x_nodes:   (B, Nmax, 15)
-        e_src:     (B, Emax)  long (invalid filled with 0)
-        e_dst:     (B, Emax)  long
-        e_attr:    (B, Emax, 3)
-        mask_nodes:(B, Nmax, 1)
-        mask_edges:(B, Emax, 1)
-        centers:   (B,)
-        y_true:    (B, 6)
+      x_nodes: (B, Nmax, 9)
+      e_src, e_dst: (B, Emax) long
+      e_attr: (B, Emax, 2)
+      mask_nodes: (B, Nmax, 1)
+      mask_edges: (B, Emax, 1)
+      centers: (B,)
+      y_true: (B, 6)
     """
     B = len(batch)
     Nmax = max(g.x.shape[0] for g in batch)
-    Emax = max(g.edge_index.shape[1] if g.edge_index.numel() > 0 else 0 for g in batch)
-    dev  = batch[0].x.device
+    Emax = max(g.edge_index.shape[1] if g.edge_index.numel() else 0 for g in batch)
+    dev = DEVICE
 
-    x_nodes    = torch.zeros(B, Nmax, 15, device=dev)
-    e_attr     = torch.zeros(B, Emax, 3,  device=dev)
-    e_src      = torch.zeros(B, Emax, dtype=torch.long, device=dev)
-    e_dst      = torch.zeros(B, Emax, dtype=torch.long, device=dev)
-    mask_nodes = torch.zeros(B, Nmax, 1,  device=dev)
-    mask_edges = torch.zeros(B, Emax, 1,  device=dev)
-    centers    = torch.zeros(B, dtype=torch.long, device=dev)
-    y_true     = torch.zeros(B, 6, device=dev)
+    x_nodes   = torch.zeros(B, Nmax, 9, device=dev)
+    e_src     = torch.zeros(B, Emax, dtype=torch.long, device=dev)
+    e_dst     = torch.zeros(B, Emax, dtype=torch.long, device=dev)
+    e_attr    = torch.zeros(B, Emax, 2, device=dev)
+    mask_nodes= torch.zeros(B, Nmax, 1, device=dev)
+    mask_edges= torch.zeros(B, Emax, 1, device=dev)
+    centers   = torch.zeros(B, dtype=torch.long, device=dev)
+    y_true    = torch.zeros(B, 6, device=dev)
 
     for b, g in enumerate(batch):
         N = g.x.shape[0]
         x_nodes[b, :N] = g.x
         mask_nodes[b, :N, 0] = 1.0
         centers[b] = g.center_idx
-        y_true[b]  = g.y
-        if g.edge_index.numel() > 0:
+        y_true[b] = g.y
+        if g.edge_index.numel():
             E = g.edge_index.shape[1]
             e_src[b, :E] = g.edge_index[0]
             e_dst[b, :E] = g.edge_index[1]
             e_attr[b, :E] = g.edge_attr
             mask_edges[b, :E, 0] = 1.0
-
     return x_nodes, e_src, e_dst, e_attr, mask_nodes, mask_edges, centers, y_true
 
-
-# ===========================================================================
-# Model: Edge-conditioned vector messages (no explicit distances)
-# ===========================================================================
-
-class EdgeMessageGNN(nn.Module):
+# ================================================================
+# 2‑D message‑passing baselines (no positional encoding beyond Δy,Δz)
+# ================================================================
+class EdgeMessageGNN2D(nn.Module):
     def __init__(self, hidden=128):
         super().__init__()
         self.hidden = hidden
         self.node_mlp = nn.Sequential(
-            nn.Linear(15, hidden),
+            nn.Linear(9, hidden),
             nn.SiLU(),
             nn.Linear(hidden, hidden),
             nn.SiLU(),
         )
-        # Vector message: [h_src (H), e (3)] -> H
+        # vector message [h_src (H), e (2)] -> H
         self.message_mlp = nn.Sequential(
-            nn.Linear(hidden + 3, hidden),
+            nn.Linear(hidden + 2, hidden),
             nn.SiLU(),
             nn.Linear(hidden, hidden),
             nn.SiLU(),
@@ -475,615 +198,727 @@ class EdgeMessageGNN(nn.Module):
             nn.Linear(hidden, 6),
         )
 
-    def forward(self, graph_batch: List[GraphSample]):
-        """Per-graph path (convenience). Aggregates messages arriving to the center."""
-        preds = []
-        for g in graph_batch:
-            h = self.node_mlp(g.x)  # (N,H)
-            if g.edge_index.numel() == 0:
-                center_msg = h[g.center_idx]
-            else:
-                src = g.edge_index[0]      # (E,)
-                dst = g.edge_index[1]      # (E,)
-                e   = g.edge_attr          # (E,3)
-                msg = self.message_mlp(torch.cat([h[src], e], dim=1))  # (E,H)
-                # Aggregate only messages that land on the center node
-                mask_c = (dst == g.center_idx)
-                center_msg = msg[mask_c].sum(dim=0) + h[g.center_idx]
-            preds.append(self.readout(center_msg))
-        return preds
-
     def forward_padded_general(self,
-                               x_nodes: torch.Tensor,           # (B,N,15)
-                               e_src: torch.Tensor,             # (B,E)
-                               e_dst: torch.Tensor,             # (B,E)
-                               e_attr: torch.Tensor,            # (B,E,3)
-                               mask_nodes: torch.Tensor,        # (B,N,1)
-                               mask_edges: torch.Tensor,        # (B,E,1)
-                               centers: torch.Tensor):          # (B,)
-        """General batched path. Aggregates messages at dst, then uses center nodes for prediction."""
+                               x_nodes: torch.Tensor,  # (B,N,9)
+                               e_src: torch.Tensor,    # (B,E)
+                               e_dst: torch.Tensor,    # (B,E)
+                               e_attr: torch.Tensor,   # (B,E,2)
+                               mask_nodes: torch.Tensor,#(B,N,1)
+                               mask_edges: torch.Tensor,#(B,E,1)
+                               centers: torch.Tensor):  # (B,)
         B, N, _ = x_nodes.shape
         E = e_attr.shape[1]
         Hmask = mask_nodes
         Emask = mask_edges
 
-        # Node encodings
+        # node embeddings
         h = self.node_mlp(x_nodes) * Hmask  # (B,N,H)
 
         if E == 0 or Emask.sum() == 0:
             rows = torch.arange(B, device=x_nodes.device)
-            h_center = h[rows, centers]  # (B,H)
+            h_center = h[rows, centers]
             return self.readout(h_center)
 
-        # Gather h_src
+        rows = torch.arange(B, device=x_nodes.device).view(B,1).expand(B,E)
         safe_src = e_src.clamp(min=0)
-        rows = torch.arange(B, device=x_nodes.device).view(B,1).expand(B, E)
-        h_src = h[rows, safe_src]  # (B,E,H)
+        h_src = h[rows, safe_src]                  # (B,E,H)
 
-        # Messages
-        msg_in = torch.cat([h_src, e_attr], dim=-1)   # (B,E,H+3)
-        msg = self.message_mlp(msg_in) * Emask        # (B,E,H)
+        msg_in = torch.cat([h_src, e_attr], dim=-1)# (B,E,H+2)
+        msg = self.message_mlp(msg_in) * Emask     # (B,E,H)
 
-        # Scatter-add to dst nodes (batch-flattened index_add)
+        # scatter-add to dst
         safe_dst = e_dst.clamp(min=0)
-        flat_dst = (safe_dst + rows * N).reshape(-1)  # (B*E,)
-        flat_msg = msg.reshape(B*E, self.hidden)      # (B*E, H)
+        flat_dst = (safe_dst + rows * N).reshape(-1)
+        flat_msg = msg.reshape(B*E, self.hidden)
         agg_flat = torch.zeros(B*N, self.hidden, device=x_nodes.device)
         agg_flat.index_add_(0, flat_dst, flat_msg)
-        agg = agg_flat.view(B, N, self.hidden)  # (B,N,H)
+        agg = agg_flat.view(B, N, self.hidden)
 
-        # Read out from center nodes
         rows = torch.arange(B, device=x_nodes.device)
-        h_center = h[rows, centers]                # (B,H)
-        m_center = agg[rows, centers]              # (B,H)
-        return self.readout(h_center + m_center)   # (B,6)
+        h_center = h[rows, centers]
+        m_center = agg[rows, centers]
+        return self.readout(h_center + m_center)
 
 
-# =========================
-# e3nn-based Equivariant GNN
-# =========================
-#from __future__ import annotations
-#from typing import Tuple, Optional, List
-#import math
-#import torch
-#import torch.nn as nn
-from e3nn.o3 import Irreps, Linear, spherical_harmonics
-#from e3nn.nn import Gate, FullyConnectedNet
-from e3nn.nn import FullyConnectedNet #, NormActivation
-from e3nn.o3 import FullyConnectedTensorProduct
+# --------------------------------------------------------------
+# Equivariant NN for the 2-D square-duct graphs (uses e3nn)
+# --------------------------------------------------------------
+import math
+import torch
+import torch.nn as nn
 
-# ---------------------------
-# Irreps bookkeeping (SO(3))
-# ---------------------------
-IRREPS_IN  = Irreps("0e + 2e + 1e + 1o + 1o")   # tr(S) | dev(S) | ω | p | t
-IRREPS_SH  = Irreps.spherical_harmonics(lmax=2) # 0e + 1o + 2e
-#IRREPS_HID = Irreps("8x0e + 4x1o + 4x1e + 4x2e")  # small & fast; tune if needed
-IRREPS_HID = Irreps("12x0e + 4x1o + 4x1e + 6x2e")
-# Or, if you want roughly same params with 3 blocks:
-# IRREPS_HID = Irreps("10x0e + 3x1o + 3x1e + 4x2e"); n_layers = 3
+try:
+    from e3nn.o3 import Irreps, Linear, spherical_harmonics
+    from e3nn.nn import FullyConnectedNet, NormActivation
+    from e3nn.o3 import FullyConnectedTensorProduct
+    _HAS_E3NN = True
+except Exception as _e:
+    _HAS_E3NN = False
+    _E3NN_IMPORT_ERR = _e
 
-IRREPS_OUT = Irreps("0e + 2e")                  # symmetric output (trace + deviator)
-
-# --------------------------------------
-# Featurizer: raw (15) -> typed irreps
-# --------------------------------------
-def decompose_grad_u_to_S_W(u_flat: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    u_flat: (..., 9) -> S(..., 3,3), W(..., 3,3)
-    """
+# ===== Helper: 9D -> (trace, l=2), 3x3 sym decomposition used in the head =====
+def _decompose_grad_u(u_flat: torch.Tensor):
     U = u_flat.view(*u_flat.shape[:-1], 3, 3)
     S = 0.5 * (U + U.transpose(-1, -2))
     W = 0.5 * (U - U.transpose(-1, -2))
     return S, W
 
-def S_to_trace_and_l2(S: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    S: (..., 3,3) symmetric
-    returns: (trace scalar 0e), (five l=2 components 2e) as (..., 1), (..., 5)
-    Mapping (real SH basis):
-      a0  = (2*Szz - Sxx - Syy)/sqrt(6)
-      a2c = (Sxx - Syy)/sqrt(2)
-      a2s = sqrt(2) * Sxy
-      a1c = sqrt(2) * Sxz
-      a1s = sqrt(2) * Syz
-    """
-    Sxx, Syy, Szz = S[..., 0, 0], S[..., 1, 1], S[..., 2, 2]
-    Sxy, Sxz, Syz = S[..., 0, 1], S[..., 0, 2], S[..., 1, 2]
-    tr = Sxx + Syy + Szz                        # (...,)
-    # deviatoric (not explicitly needed to compute a's)
-    a0  = (2.0 * Szz - Sxx - Syy) / math.sqrt(6.0)
+def _sym_to_trace_l2(S: torch.Tensor):
+    Sxx, Syy, Szz = S[...,0,0], S[...,1,1], S[...,2,2]
+    Sxy, Sxz, Syz = S[...,0,1], S[...,0,2], S[...,1,2]
+    tr = (Sxx + Syy + Szz).unsqueeze(-1)  # (..,1)
+    # 5 components (l=2 real basis) used inside e3nn path
+    a0  = (2.0*Szz - Sxx - Syy) / math.sqrt(6.0)
     a2c = (Sxx - Syy) / math.sqrt(2.0)
     a2s = math.sqrt(2.0) * Sxy
     a1c = math.sqrt(2.0) * Sxz
     a1s = math.sqrt(2.0) * Syz
-    a = torch.stack([a0, a2c, a2s, a1c, a1s], dim=-1)  # (...,5)
-    return tr.unsqueeze(-1), a
+    a = torch.stack([a0, a2c, a2s, a1c, a1s], dim=-1)  # (..,5)
+    return tr, a
 
-def W_to_axial_vector(W: torch.Tensor) -> torch.Tensor:
-    """
-    Axial vector ω s.t. W_ij = -epsilon_ijk ω_k
-    Components:
-      ωx = W_yz, ωy = W_zx, ωz = W_xy
-    """
-    wx = W[..., 1, 2]
-    wy = W[..., 2, 0]
-    wz = W[..., 0, 1]
-    return torch.stack([wx, wy, wz], dim=-1)  # (...,3)
-
-def node15_to_irreps(x_nodes: torch.Tensor) -> torch.Tensor:
-    """
-    x_nodes: (B, N, 15) = [p(3), t(3), grad_u(9)]
-    returns h0: (B, N, IRREPS_IN.dim) ordered as 0e | 2e | 1e | 1o | 1o
-    """
-    p = x_nodes[..., 0:3]       # 1o
-    t = x_nodes[..., 3:6]       # 1o
-    S, W = decompose_grad_u_to_S_W(x_nodes[..., 6:15])
-    trS, a_l2 = S_to_trace_and_l2(S)  # 0e, 2e
-    omega = W_to_axial_vector(W)      # 1e (axial)
-    # Pack in the declared order: 0e | 2e | 1e | 1o | 1o
-    return torch.cat([trS, a_l2, omega, p, t], dim=-1)
-
-# ------------------------------------------
-# Output head: (0e⊕2e) -> Mandel(6) (fixed)
-# ------------------------------------------
-def irreps_to_mandel(trace_0e: torch.Tensor, a_l2: torch.Tensor) -> torch.Tensor:
-    """
-    trace_0e: (B,*,1), a_l2: (B,*,5) in basis [a0, a2c, a2s, a1c, a1s]
-    Reconstruct S then return Mandel6: [Sxx, √2 Sxy, √2 Sxz, Syy, √2 Syz, Szz]
-    """
+def _irreps_to_mandel(trace_0e: torch.Tensor, a_l2: torch.Tensor):
+    # Rebuild S (symmetric) from (trace, l=2) in the same real basis used above,
+    # then convert to Mandel ordering [Sxx, √2Sxy, √2Sxz, Syy, √2Syz, Szz]
     a0, a2c, a2s, a1c, a1s = a_l2.unbind(dim=-1)
     dev_xx = -a0 / math.sqrt(6.0) + a2c / math.sqrt(2.0)
     dev_yy = -a0 / math.sqrt(6.0) - a2c / math.sqrt(2.0)
     dev_zz =  2.0 * a0 / math.sqrt(6.0)
-    dev_xy = a2s / math.sqrt(2.0)
-    dev_xz = a1c / math.sqrt(2.0)
-    dev_yz = a1s / math.sqrt(2.0)
-    tr = trace_0e.squeeze(-1)  # (...,)
+    dev_xy =  a2s / math.sqrt(2.0)
+    dev_xz =  a1c / math.sqrt(2.0)
+    dev_yz =  a1s / math.sqrt(2.0)
 
+    tr = trace_0e.squeeze(-1)
     Sxx = dev_xx + tr / 3.0
     Syy = dev_yy + tr / 3.0
     Szz = dev_zz + tr / 3.0
-    Sxy = dev_xy
-    Sxz = dev_xz
-    Syz = dev_yz
+    Sxy, Sxz, Syz = dev_xy, dev_xz, dev_yz
 
     s2 = math.sqrt(2.0)
     mandel = torch.stack([Sxx, s2*Sxy, s2*Sxz, Syy, s2*Syz, Szz], dim=-1)
     return mandel
 
-# ------------------------------------------
-# One message-passing block (equivariant)
-# ------------------------------------------
-'''
-class EquivariantBlock(nn.Module):
-    def __init__(self, irreps_in=IRREPS_HID, irreps_out=IRREPS_HID, lmax=2, radial_hidden=32):
+# ===== Small, parameter-comparable equivariant block =====
+class _EquivBlock(nn.Module):
+    """
+    One message-passing block using e3nn:
+      - input irreps -> hidden irreps with a linear
+      - tensor product with spherical harmonics up to l=2
+      - learned radial MLP produces tensor-product weights
+      - residual + equivariant nonlinearity
+    """
+    def __init__(self, irreps_in, irreps_out, lmax=2, radial_hidden=32):
         super().__init__()
         self.irreps_in  = Irreps(irreps_in)
-        self.irreps_out = Irreps(irreps_out)
+        self.irreps_out = Irreps(Irreps(irreps_out))
         self.irreps_sh  = Irreps.spherical_harmonics(lmax)
-        # Linear pre/post
-        self.lin_in  = Linear(self.irreps_in, self.irreps_in, biases=True)
-        # Tensor product using SH; weights come from radial MLP
-        self.tp = FullyConnectedTensorProduct(
-            self.irreps_in, self.irreps_sh, self.irreps_out, internal_weights=False, shared_weights=False
+
+        self.lin_in = Linear(self.irreps_in, self.irreps_in, biases=True)
+        self.tp     = FullyConnectedTensorProduct(
+            self.irreps_in, self.irreps_sh, self.irreps_out,
+            internal_weights=False, shared_weights=False
         )
         self.radial = FullyConnectedNet(
-            [1, radial_hidden, self.tp.weight_numel],  # |r| -> weights
-            act=nn.SiLU()
+            [1, radial_hidden, self.tp.weight_numel], act=nn.SiLU()
         )
-        # Gate nonlinearity
-        self.gate = Gate(
-            self.irreps_out,
-            act=nn.SiLU(),         # on scalars
-            gate=nn.Sigmoid()      # gates higher-l parts
-        )
-        # Residual
+        # Nonlinearity on irreps (scalars through SiLU, higher l through gated normalization)
+        try:
+            self.nonlin = NormActivation(
+                irreps_in=self.irreps_out,
+                scalar_nonlinearity=nn.SiLU(),
+                gate_nonlinearity=nn.Sigmoid(),
+                normalize=True
+            )
+        except TypeError:
+            # Backward-compat signature
+            self.nonlin = NormActivation(
+                irreps_in=self.irreps_out,
+                scalar_nonlinearity=nn.SiLU(),
+                normalize=True
+            )
+
         self.lin_res = Linear(self.irreps_in, self.irreps_out, biases=True)
 
-    def forward(self,
-                h: torch.Tensor,                # (B,N, irreps_in.dim)
-                e_src: torch.Tensor,            # (B,E) long
-                e_dst: torch.Tensor,            # (B,E) long
-                e_attr: torch.Tensor):          # (B,E,3) relative vectors
+    def forward(self, h, e_src, e_dst, e_attr3):
+        """
+        h: (B,N,C) typed by self.irreps_in
+        e_src, e_dst: (B,E) long
+        e_attr3: (B,E,3) edge vectors (we pass (0, dy, dz) here)
+        """
         B, N, _ = h.shape
-        E = e_attr.shape[1]
+        E = e_attr3.shape[1]
         rows = torch.arange(B, device=h.device).view(B, 1).expand(B, E)
 
-        # Source features
-        h_in = self.lin_in(h)  # (B,N,C)
-        h_src = h_in[rows, e_src]  # (B,E,C)
+        h_in  = self.lin_in(h)              # (B,N,Cin)
+        h_src = h_in[rows, e_src]           # (B,E,Cin)
 
-        # Edge basis: SH up to l=2 on unit direction
-        r = e_attr
-        r_norm = (r.norm(dim=-1, keepdim=True) + 1e-8)
-        r_hat = r / r_norm
-        Y = spherical_harmonics(self.irreps_sh, r_hat, normalize=True, normalization='component')  # (B,E, sum(2l+1))
+        r     = e_attr3
+        rnorm = (r.norm(dim=-1, keepdim=True) + 1e-8)
+        r_hat = r / rnorm                   # (B,E,3) unit directions
+        Y     = spherical_harmonics(self.irreps_sh, r_hat,
+                                    normalize=True, normalization='component')  # (B,E, sum(2l+1))
+        w     = self.radial(rnorm)          # (B,E, weight_numel)
 
-        # Radial weights
-        w = self.radial(r_norm)  # (B,E, tp.weight_numel)
+        msg = self.tp(h_src, Y, w)          # (B,E, Cout)
 
-        # Messages
-        msg = self.tp(h_src, Y, w)  # (B,E, irreps_out.dim)
-
-        # Scatter-add to dst
+        # scatter-add to dst
         flat_dst = (e_dst + rows * N).reshape(-1)
         msg_flat = msg.reshape(B*E, msg.shape[-1])
         agg_flat = torch.zeros(B*N, msg.shape[-1], device=h.device)
         agg_flat.index_add_(0, flat_dst, msg_flat)
         agg = agg_flat.view(B, N, -1)
 
-        # Residual + gate
-        h_res = self.lin_res(h)
-        h_out = self.gate(agg + h_res)
+        h_out = agg + self.lin_res(h)       # residual
+        h_out = self.nonlin(h_out)
         return h_out
 
-'''
-
-from e3nn.nn import FullyConnectedNet
-# NOTE: we import NormActivation inside __init__ to allow try/except version probing.
-
-class EquivariantBlock(nn.Module):
-    def __init__(self, irreps_in=IRREPS_HID, irreps_out=IRREPS_HID, lmax=2, radial_hidden=32):
+# ===== The full equivariant model (2-D adapter + e3nn core) =====
+class EquivariantGNN2D(nn.Module):
+    """
+    2-D adapter around an e3nn core:
+      * pads nodes from 9D (gradU) -> 15D [0,0,0 | 0,0,0 | gradU]
+      * lifts edges from 2D -> 3D as (0, dy, dz)
+      * uses small irreps to keep params comparable to baseline (hidden≈128)
+      * outputs Mandel(6) via (trace, l=2) head, as in your earlier code
+    """
+    def __init__(self, hidden_spec: str = "10x0e + 3x1o + 3x1e + 4x2e", n_layers: int = 2):
         super().__init__()
-        self.irreps_in  = Irreps(irreps_in)
-        self.irreps_out = Irreps(irreps_out)
-        self.irreps_sh  = Irreps.spherical_harmonics(lmax)
+        if not _HAS_E3NN:
+            raise ImportError(
+                "e3nn is required for EquivariantGNN2D. "
+                f"Original import error: {_E3NN_IMPORT_ERR}\n"
+                "Install with: pip install e3nn"
+            )
 
-        # Linear pre
-        self.lin_in  = Linear(self.irreps_in, self.irreps_in, biases=True)
+        # Input irreps: from 9D gradU -> (trace 0e, five 2e, and ω 1e) as in your earlier featurizer.
+        # We keep the same typed input as the previous e3nn path:
+        self.irreps_in  = Irreps("0e + 2e + 1e")      # (trace S) ⊕ (l=2 dev) ⊕ (axial ω)  -> built from gradU
+        self.irreps_hid = Irreps(hidden_spec)
+        self.irreps_out = Irreps("0e + 2e")          # predict (trace, l=2) then map to Mandel(6)
 
-        # Tensor product + radial weights
-        self.tp = FullyConnectedTensorProduct(
-            self.irreps_in, self.irreps_sh, self.irreps_out,
-            internal_weights=False, shared_weights=False
-        )
-        self.radial = FullyConnectedNet(
-            [1, radial_hidden, self.tp.weight_numel],
-            act=nn.SiLU()
-        )
-
-        # --- VERSION-ROBUST NONLINEARITY ---
-        # Prefer NormActivation if available; fall back gracefully if its signature differs.
-        try:
-            from e3nn.nn import NormActivation
-            # Try the "newer" signature with gate_nonlinearity available
-            try:
-                self.nonlin = NormActivation(
-                    irreps_in=self.irreps_out,
-                    scalar_nonlinearity=nn.SiLU(),
-                    gate_nonlinearity=nn.Sigmoid(),
-                    normalize=True
-                )
-            except TypeError:
-                # Older signature: no gate_nonlinearity kwarg
-                self.nonlin = NormActivation(
-                    irreps_in=self.irreps_out,
-                    scalar_nonlinearity=nn.SiLU(),
-                    normalize=True
-                )
-        except Exception:
-            # Very old e3nn without NormActivation: apply SiLU to 0e only; pass higher-l through
-            scalars = self.irreps_out.filter("0e")
-            self.scalar_act = nn.SiLU()
-            self.scalar_idx = scalars.slices()  # list of (start, stop) for 0e parts
-
-            def _fallback_nonlin(x):
-                # x: (..., C)
-                # Apply SiLU to each scalar slice; leave others as identity
-                y = x
-                for sl in self.scalar_idx:
-                    y[..., sl] = self.scalar_act(y[..., sl])
-                return y
-
-            self.nonlin = _fallback_nonlin
-        # -----------------------------------
-
-        # Residual path (match output irreps)
-        self.lin_res = Linear(self.irreps_in, self.irreps_out, biases=True)
-
-    def forward(self,
-                h: torch.Tensor,                # (B,N, Cin)
-                e_src: torch.Tensor,            # (B,E)
-                e_dst: torch.Tensor,            # (B,E)
-                e_attr: torch.Tensor):          # (B,E,3)
-        B, N, _ = h.shape
-        E = e_attr.shape[1]
-        rows = torch.arange(B, device=h.device).view(B, 1).expand(B, E)
-
-        # Source features
-        h_in  = self.lin_in(h)                  # (B,N,Cin)
-        h_src = h_in[rows, e_src]               # (B,E,Cin)
-
-        # Edge SH up to l=2
-        r = e_attr
-        r_norm = (r.norm(dim=-1, keepdim=True) + 1e-8)
-        r_hat  = r / r_norm
-        Y = spherical_harmonics(self.irreps_sh, r_hat, normalize=True, normalization='component')  # (B,E, sum_{l<=2}(2l+1))
-
-        # Radial weights and tensor product
-        w   = self.radial(r_norm)               # (B,E, weight_numel)
-        msg = self.tp(h_src, Y, w)              # (B,E, Cout)
-
-        # Scatter-add to dst
-        flat_dst = (e_dst + rows * N).reshape(-1)
-        msg_flat = msg.reshape(B*E, msg.shape[-1])
-        agg_flat = torch.zeros(B*N, msg.shape[-1], device=h.device)
-        agg_flat.index_add_(0, flat_dst, msg_flat)
-        agg = agg_flat.view(B, N, -1)           # (B,N,Cout)
-
-        # Residual + equivariant nonlinearity
-        h_out = agg + self.lin_res(h)           # (B,N,Cout)
-        h_out = self.nonlin(h_out)              # handle all versions
-        return h_out
-
-# ------------------------------------------
-# Full model: Equivariant GNN -> Mandel(6)
-# ------------------------------------------
-class EquivariantGNN_e3nn(nn.Module):
-    def __init__(self, hidden_irreps=IRREPS_HID, n_layers=2):
-        super().__init__()
-        self.irreps_in   = IRREPS_IN
-        self.irreps_hid  = Irreps(hidden_irreps)
-        self.irreps_out  = IRREPS_OUT
-
-        # Lift typed inputs -> hidden irreps
-        self.enc = Linear(self.irreps_in, self.irreps_hid, biases=True)
-
-        # Stack a few equivariant blocks
+        # Encoders/decoders
+        self.enc = Linear(self.irreps_in,  self.irreps_hid, biases=True)
         self.blocks = nn.ModuleList([
-            EquivariantBlock(self.irreps_hid, self.irreps_hid, lmax=2, radial_hidden=32)
+            _EquivBlock(self.irreps_hid, self.irreps_hid, lmax=2, radial_hidden=32)
             for _ in range(n_layers)
         ])
-
-        # Head to 0e+2e (symmetric)
         self.to_sym = Linear(self.irreps_hid, self.irreps_out, biases=True)
 
+    @staticmethod
+    def _nodes9_to_typed_irreps(x_nodes9: torch.Tensor) -> torch.Tensor:
+        """
+        x_nodes9: (..., 9) -> typed (0e ⊕ 2e ⊕ 1e) via gradU decomposition
+        """
+        S, W = _decompose_grad_u(x_nodes9)          # (...,3,3)
+        trS, a_l2 = _sym_to_trace_l2(S)             # (...,1), (...,5)
+        # axial vector from W:
+        wx, wy, wz = W[...,1,2], W[...,2,0], W[...,0,1]
+        omega = torch.stack([wx, wy, wz], dim=-1)   # (...,3)
+        return torch.cat([trS, a_l2, omega], dim=-1)
+
     def forward_padded_general(self,
-                               x_nodes: torch.Tensor,           # (B,N,15)
-                               e_src: torch.Tensor,             # (B,E)
-                               e_dst: torch.Tensor,             # (B,E)
-                               e_attr: torch.Tensor,            # (B,E,3)
-                               mask_nodes: torch.Tensor,        # (B,N,1)  {0,1}
-                               mask_edges: torch.Tensor,        # (B,E,1)  {0,1}
-                               centers: torch.Tensor) -> torch.Tensor:
+                               x_nodes: torch.Tensor,   # (B,N,9)
+                               e_src: torch.Tensor,     # (B,E)
+                               e_dst: torch.Tensor,     # (B,E)
+                               e_attr2: torch.Tensor,   # (B,E,2) (dy, dz)
+                               mask_nodes: torch.Tensor,# (B,N,1)
+                               mask_edges: torch.Tensor,# (B,E,1)
+                               centers: torch.Tensor):  # (B,)
         B, N, _ = x_nodes.shape
-        E = e_attr.shape[1]
+        E = e_attr2.shape[1]
         Hmask = mask_nodes
+        Emask = mask_edges
 
-        # 1) Featurize nodes into irreps
-        h0_typed = node15_to_irreps(x_nodes)            # (B,N, IRREPS_IN.dim)
-        h = self.enc(h0_typed) * Hmask                  # (B,N, hid.dim)
+        # 1) Lift 2D edges -> 3D (0, dy, dz)
+        e_attr3 = torch.zeros(B, E, 3, device=x_nodes.device, dtype=x_nodes.dtype)
+        e_attr3[..., 1:] = e_attr2
+        e_attr3 = e_attr3 * Emask                          # mask (safe)
 
-        # 2) Apply blocks
-        if E == 0 or mask_edges.sum() == 0:
-            # No edges: predict from center features
+        # 2) featurize nodes -> irreps
+        h0 = self._nodes9_to_typed_irreps(x_nodes)         # (B,N, 1+5+3 = 9)
+        h  = self.enc(h0) * Hmask                          # mask
+
+        # 3) blocks
+        if E == 0 or Emask.sum() == 0:
             rows = torch.arange(B, device=x_nodes.device)
-            h_c = h[rows, centers]
+            h_c  = h[rows, centers]                        # (B, hid)
         else:
-            # Mask edges by zeroing vectors where mask is 0
-            e_attr = e_attr * mask_edges  # (B,E,3)
             for blk in self.blocks:
-                h = blk(h, e_src, e_dst, e_attr)
-                h = h * Hmask
+                h = blk(h, e_src, e_dst, e_attr3) * Hmask
             rows = torch.arange(B, device=x_nodes.device)
-            h_c = h[rows, centers]  # (B, hid.dim)
+            h_c  = h[rows, centers]
 
-        # 3) Head: (0e⊕2e) then fixed map to Mandel(6)
-        sym = self.to_sym(h_c)  # (B, 1 + 5)
-        trace_0e = sym[..., 0:1]
-        a_l2     = sym[..., 1:6]
-        y_mandel = irreps_to_mandel(trace_0e, a_l2)  # (B, 6)
-        return y_mandel
+        # 4) (trace, l=2) -> Mandel(6)
+        sym   = self.to_sym(h_c)                           # (B, 1+5)
+        tr0   = sym[..., 0:1]
+        a_l2  = sym[..., 1:6]
+        yhat  = _irreps_to_mandel(tr0, a_l2)               # (B,6)
+        return yhat
 
-    def forward(self, graph_batch: List[GraphSample]):
-        """
-        Convenience list-of-graphs path to match evaluate_graph_model(model, loader)
-        """
-        # Import or reference your generic padder
-        x_nodes, e_src, e_dst, e_attr, mask_nodes, mask_edges, centers, y_true = pad_batch_graphs(graph_batch)
+# ======================================================================
+# 2‑D vector‑field generators (only one generator, SO(2) about x-axis)
+# ======================================================================
+'''
+def _as_field_lastdim(f_raw, d: int):
+    def f(x: torch.Tensor, *, meta=None) -> torch.Tensor:
+        if not isinstance(x, torch.Tensor):
+            x = torch.as_tensor(x)
+        assert x.shape[-1] == d
+        if x.ndim <= 2:
+            return f_raw(x)
+        lead = x.shape[:-1]
+        x_flat = x.reshape(-1, d)
+        y_flat = f_raw(x_flat)
+        return y_flat.reshape(*lead, d)
+    return f
 
-        # Move to device of parameters (safe for CPU/GPU)
-        dev = next(self.parameters()).device
-        x_nodes = x_nodes.to(dev)
-        e_src = e_src.to(dev)
-        e_dst = e_dst.to(dev)
-        e_attr = e_attr.to(dev)
-        mask_nodes = mask_nodes.to(dev)
-        mask_edges = mask_edges.to(dev)
-        centers = centers.to(dev)
+# node labels for 9‑D gradU block
+_NODE_LABELS = ["u11","u12","u13","u21","u22","u23","u31","u32","u33"]
+_NODE_IDX = {n:i for i,n in enumerate(_NODE_LABELS)}
 
-        # Call the batched equivariant forward
-        y_hat = self.forward_padded_general(
-            x_nodes, e_src, e_dst, e_attr, mask_nodes, mask_edges, centers
-        )  # (B,6)
+def _pair_node(a: str, b: str):
+    i, j = _NODE_IDX[a], _NODE_IDX[b]
+    return (i,j) if i<j else (j,i)
 
-        # Return a list[(6,)] to match the baseline model(batch) behavior
-        return [y_hat[i] for i in range(y_hat.shape[0])]
+# output labels for Mandel-6: [Sxx,√2 Sxy,√2 Sxz, Syy,√2 Syz, Szz]
+_ML_LABELS = ["w1","w2","w3","w4","w5","w6"]
+_ML_IDX = {n:i for i,n in enumerate(_ML_LABELS)}
 
+def _pair_out(a: str, b: str):
+    i, j = _ML_IDX[a], _ML_IDX[b]
+    return (i,j) if i<j else (j,i)
+'''
 
-# ===========================================================================
-# Training / evaluation
-# ===========================================================================
+def build_single_node_generator_X3():
+    d = 9
+    pair_node = make_pairer(["u11","u12","u13","u21","u22","u23","u31","u32","u33"])
+    fields, names = generate_euclidean_killing_fields_with_names(
+        d=d, include_translations=False, include_rotations=True, backend="torch"
+    )
+    name_to_field = {n: f for f, n in zip(fields, names)}
+    def R(i, j):
+        key = f"R_{i}_{j}" if i < j else f"R_{j}_{i}"
+        return as_field_lastdim(name_to_field[key], d=d)
+    return sum_fields(
+        R(*pair_node("u22","u23")),
+        R(*pair_node("u12","u13")),
+        R(*pair_node("u23","u33")),
+        R(*pair_node("u32","u33")),
+        R(*pair_node("u22","u32")),
+        R(*pair_node("u21","u31")),
+    )
 
+def build_single_output_generator_Y3():
+    d = 6
+    pair_out = make_pairer(["w1","w2","w3","w4","w5","w6"])
+    fields, names = generate_euclidean_killing_fields_with_names(
+        d=d, include_translations=False, include_rotations=True, backend="torch"
+    )
+    name_to_field = {n: f for f, n in zip(fields, names)}
+    def R(i, j):
+        key = f"R_{i}_{j}" if i < j else f"R_{j}_{i}"
+        return as_field_lastdim(name_to_field[key], d=d)
+    s2 = math.sqrt(2.0)
+    return sum_fields(
+        R(*pair_out("w4","w5")),
+        R(*pair_out("w5","w6")),
+        R(*pair_out("w2","w3")),
+        weights=[s2, s2, 1.0],
+    )
+
+def build_single_edge_generator_Ex():
+    d = 2
+    fields, names = generate_euclidean_killing_fields_with_names(
+        d=d, include_translations=False, include_rotations=True, backend="torch"
+    )
+    name_to_field = {n: f for f, n in zip(fields, names)}
+    # Return the wrapped field directly (accepts meta/grad)
+    return as_field_lastdim(name_to_field["R_0_1"], d=d)
+
+# ============================================================
+# Training / evaluation (baseline / regularized / equivariant)
+# ============================================================
 @torch.no_grad()
-def evaluate_graph_model(model: nn.Module, loader: DataLoader) -> dict:
+def evaluate(model: nn.Module, loader: DataLoader):
     model.eval()
-    sse = mae = sum_y = sum_y2 = 0.0
+    sse = mae = sy = sy2 = 0.0
     n = 0
     for batch in loader:
-        y_pred = torch.stack(model(batch), dim=0).to(DEVICE)  # (B,6)
-        y_true = torch.stack([g.y for g in batch], dim=0).to(DEVICE)
+        x_nodes, e_src, e_dst, e_attr, mask_nodes, mask_edges, centers, y_true = pad_batch_stars(batch)
+        y_pred = model.forward_padded_general(x_nodes, e_src, e_dst, e_attr, mask_nodes, mask_edges, centers)
         sse += F.mse_loss(y_pred, y_true, reduction="sum").item()
-        mae += F.l1_loss(y_true, y_pred, reduction="sum").item()
-        sum_y += float(y_true.sum()); sum_y2 += float((y_true**2).sum())
+        mae += F.l1_loss(y_pred, y_true, reduction="sum").item()
+        sy  += float(y_true.sum()); sy2 += float((y_true**2).sum())
         n += y_true.numel()
-    mse = sse / max(n, 1)
-    ybar = sum_y / max(n, 1)
-    sst = max(sum_y2 - n*(ybar**2), 1e-12)
-    r2 = 1.0 - (sse / sst) if sst > 0 else float("nan")
-    return {"MSE": mse, "MAE": mae / max(n,1), "R2": r2}
+    mse = sse / max(n,1)
+    ybar = sy / max(n,1)
+    sst = max(sy2 - n*(ybar**2), 1e-12)
+    r2  = 1. - (sse/sst) if sst>0 else float("nan")
+    return {"MSE": mse, "MAE": mae/max(n,1), "R2": r2}
 
-def train_graphs(
-    runtype: str = "baseline",        # "baseline" | "regularized" | "EquivariantNN"
-    epochs: int = 1000,
-    batch_size: int = 32,
+def train_squareduct(
+    train_paths: Sequence[Path],
+    test_paths:  Sequence[Path],
+    runtype: str = "baseline",     # "baseline" | "regularized" | "EquivariantNN"
+    epochs: int = 300,
+    batch_size: int = 64,
     lr: float = 1e-3,
     weight_decay: float = 1e-4,
-    gamma_val: float = 0.5,           # penalty mixture
-    gamma_wait: int = 0,              # warmup epochs with gamma=0
-    sample_fields: Optional[int] = None,  # sample {1,2} of Xk to speed up, or None
-    total_graphs: int = 200,
-    max_missing: int = 6,
-    sigma: float = 1.0,
-    seed: int = 13,
+    gamma_val: float = 0.5,        # equivariance penalty mixture
+    gamma_wait: int = 0,           # warm-up epochs with gamma=0
 ):
-    # Data
-    train_ds, test_ds = build_train_test_datasets(DEVICE, total_graphs, max_missing, sigma, seed)
-    collate = lambda batch: batch
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  drop_last=False, collate_fn=collate)
-    test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, drop_last=False, collate_fn=collate)
+    # Datasets / loaders
+    ds_tr = SquareDuctStars(train_paths, split="upper")
+    ds_te = SquareDuctStars(test_paths,  split="lower")
+    tr_loader = DataLoader(ds_tr, batch_size=batch_size, shuffle=True,  drop_last=False, collate_fn=collate_list)
+    te_loader = DataLoader(ds_te, batch_size=batch_size, shuffle=False, drop_last=False, collate_fn=collate_list)
 
     # Model
     if runtype == "EquivariantNN":
-        model = EquivariantGNN_e3nn(hidden_irreps=IRREPS_HID, n_layers=2).to(DEVICE)
+        # Placeholder: same backbone as baseline for now
+        model = EdgeMessageGNN2D(hidden=128).to(DEVICE)
     else:
-        model = EdgeMessageGNN(hidden=128).to(DEVICE)
+        model = EdgeMessageGNN2D(hidden=128).to(DEVICE)
 
-    # Optim
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     mse = nn.MSELoss()
 
-    # Build base generators once
-    X1, X2, X3 = build_node_generators_vector_fields()
-    E1, E2, E3 = build_edge_generators_vector_fields()
-    Y1, Y2, Y3 = build_output_generators_vector_fields()
-    Yk = [Y1, Y2, Y3]
+    # Build single generators once (2‑D only)
+    X3 = build_single_node_generator_X3()
+    Y3 = build_single_output_generator_Y3()
+    Ex = build_single_edge_generator_Ex()
 
-    train_mse: List[float] = []
-    test_mse:  List[float] = []
-    train_r2:  List[float] = []
-    test_r2:   List[float] = []
+    # Schedules
+    def gamma_schedule(e): return 0.0 if e<=gamma_wait else gamma_val
 
-    penalties_scaled = False
-    scale = torch.tensor(1.0, device=DEVICE)
+    tr_hist, te_hist = [], []
 
-    def gamma_schedule(e: int) -> float:
-        return 0.0 if e <= gamma_wait else gamma_val
-
-    for epoch in range(1, epochs+1):
+    for ep in range(1, epochs+1):
         model.train()
-        gamma = float(gamma_schedule(epoch))
+        gamma = float(gamma_schedule(ep))
+        for batch in tr_loader:
+            x_nodes, e_src, e_dst, e_attr, mask_nodes, mask_edges, centers, y_true = pad_batch_stars(batch)
 
-        for batch in train_loader:
-            # Pad generically (no star assumptions)
-            x_nodes, e_src, e_dst, e_attr, mask_nodes, mask_edges, centers, y_true = pad_batch_graphs(batch)
-            x_nodes = x_nodes.to(DEVICE)
-            e_src   = e_src.to(DEVICE); e_dst = e_dst.to(DEVICE); e_attr = e_attr.to(DEVICE)
-            mask_nodes = mask_nodes.to(DEVICE); mask_edges = mask_edges.to(DEVICE)
-            centers = centers.to(DEVICE); y_true = y_true.to(DEVICE)
-
-            # Define single-tensor wrapper for penalties (Pattern B)
+            # Pack into a single flat vector [nodes|edges] for the penalty path
             B, N, _ = x_nodes.shape
             E = e_attr.shape[1]
-            x_flat  = pack_flat(x_nodes, e_attr)
-            m_flat  = build_flat_mask(mask_nodes, mask_edges)
+            x_flat = pack_flat(x_nodes, e_attr)         # (B, N*9 + E*2)
+            m_flat = build_flat_mask(mask_nodes, mask_edges)
 
-            # Build total input fields on flat packing (once per (N,E) shape)
-            # To avoid re-allocating each minibatch, you can cache by (N,E) key if needed.
-            G_nodes = [lift_field_to_flat_segment(Xk, count=N, dim=15, offset=0) for Xk in (X1, X2, X3)]
-            G_edges = [lift_field_to_flat_segment(Ek, count=E, dim=3,  offset=N*15) for Ek in (E1, E2, E3)]
-            Gk_flat = [sum_fields(G_nodes[k], G_edges[k]) for k in range(3)]  # G1,G2,G3 on (B, N*15+E*3)
+            # Lift fields to segments
+            G_nodes = lift_field_to_flat_segment(X3, count=N, dim=9, offset=0)
+            G_edge  = lift_field_to_flat_segment(Ex, count=E, dim=2, offset=N*9)
+            G3_flat = sum_fields(G_nodes, G_edge)
 
-            # Adapter from flat -> model forward
             def model_flat(xf: torch.Tensor) -> torch.Tensor:
-                xn, ee = unpack_flat(xf, N, E)
+                xn, ee = unpack_flat(xf, N, E, node_dim=9, edge_dim=2)
                 return model.forward_padded_general(xn, e_src, e_dst, ee, mask_nodes, mask_edges, centers)
 
-            # Forward w/ or w/o equivariance regularization
             if runtype == "regularized":
+                # Forward with single-generator penalty
                 y_pred, sym_pen = forward_with_equivariance_penalty(
                     model=model_flat,
-                    X_in=Gk_flat,
-                    Y_out=Yk,
+                    X_in=[G3_flat],
+                    Y_out=[Y3],
                     x=x_flat,
-                    #mask=m_flat,
+                    # mask=m_flat,                       # optionally pass mask
                     loss=nn.MSELoss(),
-                    sample_fields=sample_fields,
-                    weights=[1.0, 1.0, 1.0],
+                    sample_fields=None,
+                    weights=[1.0],
                 )
-            elif runtype == "baseline":
-                y_pred = model.forward_padded_general(x_nodes, e_src, e_dst, e_attr, mask_nodes, mask_edges, centers)
-                sym_pen = torch.tensor(0.0, device=DEVICE)
-            elif runtype == "EquivariantNN":
-                # Placeholder: replace with explicit equivariant architecture later
-                y_pred = model.forward_padded_general(x_nodes, e_src, e_dst, e_attr, mask_nodes, mask_edges, centers)
-                sym_pen = torch.tensor(0.0, device=DEVICE)
+                loss_m = mse(y_pred, y_true)
+                loss   = (1.0 - gamma)*loss_m + gamma*sym_pen
             else:
-                raise ValueError(f"Unknown runtype={runtype}")
-
-            model_loss = mse(y_pred, y_true)
-            if (runtype == "regularized") and (gamma != 0.0) and not penalties_scaled:
-                denom = torch.clamp(sym_pen.detach(), min=1e-8)
-                scale = (model_loss.detach() / denom).to(DEVICE)
-                penalties_scaled = True
-
-            if runtype == "regularized":
-                loss = (1.0 - gamma) * model_loss + gamma * scale * sym_pen
-            else:
-                loss = model_loss
+                y_pred = model.forward_padded_general(x_nodes, e_src, e_dst, e_attr, mask_nodes, mask_edges, centers)
+                loss = mse(y_pred, y_true)
 
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
 
-        # Epoch metrics
-        if epoch == 1 or epoch % 10 == 0 or epoch == epochs:
-            tr = evaluate_graph_model(model, train_loader)
-            te = evaluate_graph_model(model, test_loader)
-            train_mse.append(tr["MSE"]); test_mse.append(te["MSE"])
-            train_r2.append(tr["R2"]);   test_r2.append(te["R2"])
-            print(f"[{epoch:04d}/{epochs}] "
-                  f"Train MSE={tr['MSE']:.6f}, R2={tr['R2']:.4f} | "
-                  f"Test MSE={te['MSE']:.6f}, R2={te['R2']:.4f} | "
-                  f"γ={gamma:.2f}, scale={float(scale):.3g}")
+        # epoch metrics
+        tr = evaluate(model, tr_loader)
+        te = evaluate(model, te_loader)
+        tr_hist.append(tr); te_hist.append(te)
+        if ep==1 or ep%10==0 or ep==epochs:
+            print(f"[{ep:04d}/{epochs}] "
+                  f"Train MSE={tr['MSE']:.6e}, R2={tr['R2']:.4f} | "
+                  f"Test MSE={te['MSE']:.6e}, R2={te['R2']:.4f} | "
+                  f"γ={gamma:.2f}")
 
-    return model, train_mse, test_mse, train_r2, test_r2, runtype
+    return model, tr_hist, te_hist
+
+################################
+# Actual training
+################################
+
+def make_gamma_schedule(
+    *,
+    name: str | Callable[[int], float] = "jump",
+    max_val: float = 0.5,
+    warmup_steps: int | None = None,
+    total_steps: int | None = None,
+    tau: float | None = None,
+    delay_steps: int | None = None,
+) -> Callable[[int], float]:
+    """
+    Returns gamma(step) in [0, max_val].
+    If `name` is callable, it is returned as-is.
+    Valid names: "constant", "linear_warmup", "cosine", "exponential", "jump".
+    """
+    if callable(name):
+        return name
+
+    name = str(name).lower()
+    if name == "constant":
+        return S.constant(max_val)
+    elif name == "linear_warmup":
+        if warmup_steps is None:
+            raise ValueError("linear_warmup requires warmup_steps")
+        return S.linear_warmup(max_val, warmup_steps)
+    elif name == "cosine":
+        if total_steps is None:
+            raise ValueError("cosine requires total_steps")
+        return S.cosine(max_val, total_steps)
+    elif name == "exponential":
+        if tau is None:
+            raise ValueError("exponential requires tau")
+        return S.exponential(max_val, tau)
+    elif name == "jump":
+        if delay_steps is None:
+            raise ValueError("jump requires delay_steps")
+        return S.jump(max_val, delay_steps)
+    else:
+        raise ValueError(f"Unknown schedule name: {name}")
 
 
-# ===========================================================================
-# Main (choose mode and export CSV)
-# ===========================================================================
+def run_squareduct_training(
+    train_npz_paths,                   # list[str|Path]
+    test_npz_paths,                    # list[str|Path]
+    *,
+    runtype: str = "baseline",         # "baseline" | "regularized" | "EquivariantNN"
+    epochs: int = 300,
+    batch_size: int = 64,
+    lr: float = 1e-3,
+    weight_decay: float = 1e-4,
+    # --- scheduling controls ---
+    gamma_sched_name: str = "jump",    # "constant" | "linear_warmup" | "cosine" | "exponential" | "jump"
+    gamma_sched_kwargs: dict | None = None,  # e.g., {"max_val":0.5, "delay_steps":10}
+    gamma_per_batch: bool = False,     # if True, schedule uses global batch step; else epoch index
+    verbose_every: int = 10,
+):
+    """
+    Train on square-duct 2-D star graphs (upper-half train, lower-half test).
+    Returns: (model, train_history, test_history)
+      where *_history is a list of dicts with keys "MSE","MAE","R2" per epoch.
+    """
 
-if __name__ == "__main__":
-    # Change runtype to "regularized" for JVP penalty; "baseline" for plain supervised;
-    # "EquivariantNN" will be wired later to an explicit equivariant architecture.
-    runtype = "baseline"   # "baseline" | "regularized" | "EquivariantNN"
+    # -----------------------------
+    # Datasets / loaders
+    # -----------------------------
+    if not isinstance(train_npz_paths, (list, tuple)): train_npz_paths = [train_npz_paths]
+    if not isinstance(test_npz_paths,  (list, tuple)): test_npz_paths  = [test_npz_paths]
+
+    ds_tr = SquareDuctStars(train_npz_paths, split="upper")
+    ds_te = SquareDuctStars(test_npz_paths,  split="lower")
+    tr_loader = DataLoader(ds_tr, batch_size=batch_size, shuffle=True,
+                           drop_last=False, collate_fn=collate_list)
+    te_loader = DataLoader(ds_te, batch_size=batch_size, shuffle=False,
+                           drop_last=False, collate_fn=collate_list)
+
+    # -----------------------------
+    # Model & optimizer
+    # -----------------------------
+    if runtype == "EquivariantNN":
+        # Placeholder = same backbone (replace later with a 2-D SO(2)/D4 equivariant layer)
+        model = EquivariantGNN2D(
+            hidden_spec="10x0e + 3x1o + 3x1e + 4x2e",  # tune if you want
+            n_layers=2
+        ).to(DEVICE)
+
+    else:
+        model = EdgeMessageGNN2D(hidden=128).to(DEVICE)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    mse = nn.MSELoss()
+
+    # -----------------------------
+    # 2-D generators
+    # -----------------------------
+    X3 = build_single_node_generator_X3()   # acts on 9-D gradU
+    Y3 = build_single_output_generator_Y3() # acts on Mandel-6 outputs
+    Ex = build_single_edge_generator_Ex()   # acts on 2-D edge vectors
+
+    # -----------------------------
+    # Gamma schedule
+    # -----------------------------
+    steps_per_epoch = max(1, len(tr_loader))
+    if gamma_sched_kwargs is None: gamma_sched_kwargs = {}
+
+    # Resolve total_steps for cosine when used per-batch/per-epoch
+    if gamma_sched_name.lower() == "cosine" and "total_steps" not in gamma_sched_kwargs:
+        gamma_sched_kwargs["total_steps"] = (epochs * steps_per_epoch) if gamma_per_batch else epochs
+
+    # Resolve "jump" default (common replacement for your previous gamma_wait)
+    if gamma_sched_name.lower() == "jump" and "delay_steps" not in gamma_sched_kwargs:
+        # default jump at epoch 0 => immediate max_val; or set your previous gamma_wait here
+        gamma_sched_kwargs["delay_steps"] = 0
+
+    gamma_fn = make_gamma_schedule(name=gamma_sched_name, **gamma_sched_kwargs)
+
+    # -----------------------------
+    # Logs & scaling
+    # -----------------------------
+    train_hist, test_hist = [], []
+    penalties_scaled = False
+    scale = torch.tensor(1.0, device=DEVICE)   # default to 1.0; will be bootstrapped once
+
+    # -----------------------------
+    # Training loop
+    # -----------------------------
+    global_step = 0
+    for ep in range(1, epochs+1):
+
+        model.train()
+
+        for bidx, batch in enumerate(tr_loader):
+            # pick schedule value (per-batch or per-epoch)
+            if gamma_per_batch:
+                gamma = float(gamma_fn(global_step))
+            else:
+                gamma = float(gamma_fn(ep))
+
+            x_nodes, e_src, e_dst, e_attr, mask_nodes, mask_edges, centers, y_true = pad_batch_stars(batch)
+            # Sanity (helps catch shape drift)
+            assert x_nodes.shape[-1] == 9 and e_attr.shape[-1] == 2, "Expect node_dim=9, edge_dim=2 for 2-D setup"
+
+            # Flat packing for penalty path: [nodes | edges]
+            B, N, _ = x_nodes.shape
+            E = e_attr.shape[1]
+            x_flat = pack_flat(x_nodes, e_attr)         # (B, N*9 + E*2)
+
+            # Lift generators to segments and sum them
+            G_nodes = lift_field_to_flat_segment(X3, count=N, dim=9, offset=0)
+            G_edge  = lift_field_to_flat_segment(Ex, count=E, dim=2, offset=N*9)
+            G3_flat = sum_fields(G_nodes, G_edge)
+
+            def model_flat(xf: torch.Tensor) -> torch.Tensor:
+                xn, ee = unpack_flat(xf, N, E, node_dim=9, edge_dim=2)
+                return model.forward_padded_general(xn, e_src, e_dst, ee, mask_nodes, mask_edges, centers)
+
+            if runtype == "regularized" and gamma > 0.0:
+                # Compute y and symmetry penalty in one pass
+                y_pred, sym_pen = forward_with_equivariance_penalty(
+                    model=model_flat,
+                    X_in=[G3_flat],
+                    Y_out=[Y3],
+                    x=x_flat,
+                    loss=nn.MSELoss(),       # penalty aggregator (MSE)
+                    sample_fields=None,
+                    weights=[1.0],
+                )
+                loss_m = mse(y_pred, y_true)
+
+                # Bootstrap scale once so model_loss and sym_pen have similar magnitudes initially
+                if not penalties_scaled:
+                    denom = torch.clamp(sym_pen.detach(), min=1e-8)
+                    # protect against NaN/Inf in denom
+                    if torch.isfinite(denom).all():
+                        scale = (loss_m.detach() / denom).to(DEVICE)
+                        penalties_scaled = True
+                    else:
+                        scale = torch.tensor(1.0, device=DEVICE)
+                        penalties_scaled = True
+
+                loss = (1.0 - gamma) * loss_m + gamma * (sym_pen * scale)
+
+            else:
+                # Either no regularization (baseline / EquivariantNN placeholder)
+                # or gamma==0 => skip symmetry path entirely
+                y_pred = model.forward_padded_general(x_nodes, e_src, e_dst, e_attr,
+                                                      mask_nodes, mask_edges, centers)
+                loss = mse(y_pred, y_true)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+            global_step += 1  # for per-batch schedules
+
+        # ---- epoch metrics
+        tr = evaluate(model, tr_loader)
+        te = evaluate(model, te_loader)
+        train_hist.append(tr); test_hist.append(te)
+
+        # Report epoch-level gamma (use last gamma seen)
+        if (ep == 1) or (ep % verbose_every == 0) or (ep == epochs):
+            print(f"[{ep:04d}/{epochs}] "
+                  f"Train MSE={tr['MSE']:.6e}, R2={tr['R2']:.4f} | "
+                  f"Test MSE={te['MSE']:.6e},  R2={te['R2']:.4f} | "
+                  f"γ={gamma:.4f} | scale={float(scale):.3g}")
+
+    return model, train_hist, test_hist
+
+
+# Example:
+model, tr_hist, te_hist = run_squareduct_training(
+     train_npz_paths=[
+         #"graphs_r/squareDuct_1100_r0.0500.npz",
+         #"graphs_r/squareDuct_1500_r0.0500.npz",
+         "/home/ben/Documents/UQ_Postdoc/curated_ds_work/graphs_r/squareDuct_1100_mandel_r0.0200.npz"
+     ],
+     test_npz_paths=[
+         #"graphs_r/squareDuct_2200_r0.0500.npz",
+         #"graphs_r/squareDuct_3500_r0.0500.npz",
+         "/home/ben/Documents/UQ_Postdoc/curated_ds_work/graphs_r/squareDuct_1100_mandel_r0.0200.npz"
+     ],
+     runtype="regularized",   # "baseline" | "regularized" | "EquivariantNN"
+     epochs=50,
+     gamma_sched_name="jump",
+     gamma_sched_kwargs={"max_val": 0.5, "delay_steps": 0},
+     gamma_per_batch=False, # so that the schedule uses the epoch index.
+     batch_size=64, lr=1e-3, weight_decay=1e-4
+ )
+
+
+# ============================
+# CLI
+# ============================
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--train_npz", type=str, nargs="+", required=True,
+                    help="Paths to training NPZ packs (e.g., multiple Re but upper-half centers will be selected).")
+    ap.add_argument("--test_npz",  type=str, nargs="+", required=True,
+                    help="Paths to testing NPZ packs (lower-half centers will be selected).")
+    ap.add_argument("--runtype",   type=str, default="baseline",
+                    choices=["baseline","regularized","EquivariantNN"])
+    ap.add_argument("--epochs",    type=int, default=300)
+    ap.add_argument("--batch_size",type=int, default=64)
+    ap.add_argument("--lr",        type=float, default=1e-3)
+    ap.add_argument("--wd",        type=float, default=1e-4)
+    ap.add_argument("--gamma",     type=float, default=0.5)
+    ap.add_argument("--gamma_wait",type=int, default=0)
+    ap.add_argument("--save_csv",  type=str, default="")
+    args = ap.parse_args()
 
     t0 = time.time()
-    model, tr_mse, te_mse, tr_r2, te_r2, mode = train_graphs(
-        runtype=runtype,
-        epochs = 100 if runtype=="regularized" else 800 if runtype=="baseline" else 150,
-        batch_size=32,
-        lr=1e-3,
-        weight_decay=1e-4,
-        gamma_val=0.5 if runtype=="regularized" else 0.0,
-        gamma_wait=0,
-        sample_fields=None,           # or 1 for speed
-        total_graphs=4000,             # 2000 train + 2000 test
-        max_missing=6,
-        sigma=1.0,
-        seed=13,
+    model, tr, te = train_squareduct(
+        train_paths=[Path(p) for p in args.train_npz],
+        test_paths=[Path(p)  for p in args.test_npz],
+        runtype=args.runtype,
+        epochs=args.epochs, batch_size=args.batch_size,
+        lr=args.lr, weight_decay=args.wd,
+        gamma_val=args.gamma, gamma_wait=args.gamma_wait
     )
     t1 = time.time()
-    ttime = t1 - t0
-    titime = int(ttime)
-    print(f"Total training time: {ttime:.2f} s")
+    print(f"Total training time: {t1 - t0:.2f} s")
 
-    # ---- CSV export ----
-    fname = f"{mode}_metrics{titime}.csv"
-    with open(fname, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["epoch_idx", "train_mse", "test_mse", "train_r2", "test_r2"])
-        for i, (a, b, c, d) in enumerate(zip(tr_mse, te_mse, tr_r2, te_r2), start=1):
-            w.writerow([i, a, b, c, d])
-    print(f"Wrote metrics to {fname}")
+    if args.save_csv:
+        with open(args.save_csv, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["epoch","train_mse","test_mse","train_r2","test_r2"])
+            for i,(a,b) in enumerate(zip(tr,te), start=1):
+                w.writerow([i, a["MSE"], b["MSE"], a["R2"], b["R2"]])
+        print(f"Wrote metrics to {args.save_csv}")
+
+#if __name__ == "__main__":
+#    main()
