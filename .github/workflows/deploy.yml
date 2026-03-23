@@ -1,0 +1,45 @@
+name: Deploy symdisc site & docs
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.x"
+
+      - name: Install MkDocs + Material
+        run: |
+          pip install mkdocs mkdocs-material
+
+      - name: Build MkDocs documentation
+        run: |
+          mkdocs build --clean
+        # This outputs documentation into site/docs/
+
+      - name: Prepare final output directory
+        run: |
+          mkdir deploy_output
+          cp -r site/* deploy_output/
+        # deploy_output/ now contains:
+        #   index.html, css/, js/, images/, docs/
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: deploy_output
+          force_orphan: true

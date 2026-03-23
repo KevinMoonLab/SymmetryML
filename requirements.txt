@@ -1,0 +1,13 @@
+# from pyproject.toml:
+numpy>=1.24
+scikit-learn>=1.3
+
+# Additional dependencies:
+torch>=2.0
+matplotlib>=3.7
+#e3nn>=0.5 # this can be compared with, but is not needed.
+__future__
+
+# Optional: Qt backend for matplotlib if you use QtAgg in examples
+# One of the following may be required depending on your environment:
+# PyQt5>=5.15  OR  PySide6>=6.5

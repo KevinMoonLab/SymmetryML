@@ -1,0 +1,26 @@
+site_name: symdisc documentation
+
+# This tells MkDocs to place the generated HTML under site/docs/
+# so that your final website will have:  /docs/  for documentation.
+site_dir: site/docs
+
+nav:
+  - Homepage: ../index.html
+  - Home: index.md
+  - Concepts:
+      - Discovery: discovery.md
+      - Level-Set Estimation (LSE): lse.md
+      - Regularization: regularization.md
+      - Canonicalization (WIP): canonicalization.md
+
+theme:
+  name: material
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.instant
+
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
