@@ -871,8 +871,8 @@ model, tr_hist, te_hist = run_squareduct_training(
          #"graphs_r/squareDuct_3500_r0.0500.npz",
          "/home/ben/Documents/UQ_Postdoc/curated_ds_work/graphs_r/squareDuct_1100_mandel_r0.0200.npz"
      ],
-     runtype="regularized",   # "baseline" | "regularized" | "EquivariantNN"
-     epochs=50,
+     runtype="EquivariantNN",   # "baseline" | "regularized" | "EquivariantNN"
+     epochs=100,
      gamma_sched_name="jump",
      gamma_sched_kwargs={"max_val": 0.5, "delay_steps": 0},
      gamma_per_batch=False, # so that the schedule uses the epoch index.

@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>symdisc — Continuous Symmetry Discovery & Enforcement</title>
+  <meta name="description" content="symdisc: continuous symmetry discovery & enforcement using vector fields" />
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/main.css" />
+</head>
+
+<body>
+  <header class="nav">
+    <div class="container nav-inner">
+      <div class="brand">symdisc</div>
+      <nav class="links">
+        <a href="features.html">Features</a>
+        <a href="use-cases.html">Use cases</a>
+        <a href="/docs/">Docs</a>
+        <a class="btn" href="https://github.com/KevinMoonLab/SymmetryML" target="_blank" rel="noopener">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <section class="hero">
+    <div class="container hero-inner">
+      <div class="hero-copy">
+        <h1>Continuous symmetry<br/> discovery & enforcement</h1>
+        <p>
+          <strong>symdisc</strong> discovers and enforces continuous symmetries using <em>vector field infinitesimal generators.</em> Use it to discover continuous symmetry in data and differentiable models, or to enforce continuous symmetry in model training. Both invariance and equivariance are supported. 
+        </p>
+        <div class="cta">
+          <a class="btn primary" href="/docs/">Read the Docs</a>
+          <a class="btn ghost" href="https://arxiv.org/abs/2406.03619" target="_blank" rel="noopener">
+            NeurIPS Paper
+          </a>
+        </div>
+      </div>
+
+      <div class="hero-visual">
+        <canvas id="vfCanvas" width="520" height="320"></canvas>
+        <div class="caption">Concept sketch: a time-dependent vector field infinitesimal generator</div>
+      </div>
+    </div>
+  </section>
+
+  <section id="features" class="features">
+    <div class="container grid">
+      <div class="card">
+        <h3>Symmetry Discovery</h3>
+        <p>Estimate vector fields that generate group actions, either from models or data.</p>
+      </div>
+
+      <div class="card">
+        <h3>Application‑ready enforcement</h3>
+        <p>Plug-in regularizers to encourage <strong>invariance</strong> or <strong>equivariance</strong>, keeping your existing models and training loops.</p>
+      </div>
+
+      <div class="card">
+        <h3>Level Set Estimation</h3>
+        <p>Level‑set estimation with projected geodesic / second‑order distances for geometry-aware workflows.</p>
+      </div>
+
+      <div class="card">
+        <h3>Designed for scale</h3>
+        <p>Batch‑friendly, differentiable components and schedules that slot into modern PyTorch training pipelines.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="use-cases" class="use-cases">
+    <div class="container">
+      <h2>Where symdisc helps</h2>
+      <ul class="bullets">
+        <li><strong>Peek into the Blackbox</strong>: discovered symmetries can inform expected model behavior</li>
+        <li><strong>Generalize to unseen data</strong>: soft (regularization) or hard (canonicalization) enforcement without augmentation.</li>
+        <li><strong>Scientific ML</strong>: encode conservation laws and symmetries as generators.</li>
+      </ul>
+      <div class="cta">
+        <a class="btn primary" href="/docs/">Get started</a>
+        <a class="btn" href="https://github.com/KevinMoonLab/SymmetryML" target="_blank" rel="noopener">
+          Star on GitHub
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <footer class="footer">
+    <div class="container footer-inner">
+      <div>© <span id="year"></span> symdisc</div>
+      <div class="small-links">
+        <a href="/docs/">Docs</a>
+        <a href="https://arxiv.org/abs/2406.03619" target="_blank" rel="noopener">NeurIPS 2024</a>
+        <a href="https://arxiv.org/abs/2505.08219" target="_blank" rel="noopener">Multi‑parameter Generators</a>
+      </div>
+    </div>
+  </footer>
+
+  <script src="js/main.js"></script>
+</body>
+</html>
