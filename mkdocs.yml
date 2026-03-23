@@ -5,6 +5,7 @@ site_name: symdisc documentation
 site_dir: site/docs
 
 nav:
+  - Homepage: ../index.html
   - Home: index.md
   - Concepts:
       - Discovery: discovery.md
