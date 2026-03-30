@@ -12,7 +12,7 @@ venv/
 # Packaging / build
 build/
 dist/
-*.egg-info/
+.egg-info/
 .eggs/
 
 # Tests, coverage, linters
