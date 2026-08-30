@@ -31,6 +31,13 @@ from .time_series import (
     diagonalize_over_time_and_features,
 )
 
+from .basis import (
+    LieAlgebraBasis,
+    StructureConstants,
+    VectorField,
+    VectorFieldBasis,
+    vector_field_from_components,
+)
 
 __all__ = [
     "generate_euclidean_killing_fields",
@@ -45,4 +52,9 @@ __all__ = [
     "diagonalize_over_features",
     "diagonalize_over_time_and_features",
     "vertical_scaling_field",
+    "LieAlgebraBasis",
+    "StructureConstants",
+    "VectorField",
+    "VectorFieldBasis",
+    "vector_field_from_components",
 ]
